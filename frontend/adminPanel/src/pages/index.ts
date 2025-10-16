@@ -1,0 +1,9 @@
+export { default as Dashboard } from './Dashboard';
+export { default as VehiclesList } from './VehiclesList';
+export { default as UsersList } from './UsersList';
+export { default as GuardsList } from './GuardsList';
+export { default as VehicleRequests } from './VehicleRequests';
+export { default as InOutLogs } from './InOutLogs';
+export { default as DuesPayments } from './DuesPayments';
+export { default as AuditLogs } from './AuditLogs';
+export { default as Settings } from './Settings';
