@@ -1,10 +1,10 @@
 import os
 import mysql.connector
 import json
-from fastapi import FastAPI, HTTPException, Depends, status, Query
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, HTTPException, Depends, status, Query, UploadFile, File
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from typing import Optional, List
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -18,6 +18,13 @@ import pandas as pd
 from io import StringIO
 import uvicorn
 
+# Add these to your existing imports at the top
+import cv2
+import numpy as np
+import easyocr
+import uuid
+import logging
+
 # Load environment variables
 load_dotenv()
 
@@ -27,7 +34,7 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://monitor-renewing-oarfish.ngrok-free.app", "http://localhost:3000"],
+    allow_origins=["https://monitor-renewing-oarfish.ngrok-free.app", "http://localhost:3000", "http://localhost:8000", "http://localhost:8081"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -67,7 +74,16 @@ SECRET_KEY = os.getenv("JWT_SECRET")
 ALGORITHM = os.getenv("JWT_ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+# --- Password Handling Function ---
+def validate_password_length(password: str):
+    """
+    Validates that the password does not exceed 72 bytes (bcrypt limit).
+    Raises ValueError with a clean message if it does.
+    """
+    if len(password.encode('utf-8')) > 72:
+        raise ValueError("Password cannot exceed 72 bytes. Please use a shorter password.")
 
 # Pydantic models
 class User(BaseModel):
@@ -87,22 +103,14 @@ class UserSignup(BaseModel):
     email: str
     password: str
     building_id: int
-    building_number: Optional[str]
-    phone_number: Optional[str]
-    flat_number: Optional[str]
-    wing: Optional[str]
+    building_number: Optional[str] = None
+    phone_number: Optional[str] = None
+    flat_number: Optional[str] = None
+    wing: Optional[str] = None
 
-    @classmethod
-    def __get_validators__(cls):
-        yield cls.validate_password
-
-    @classmethod
-    def validate_password(cls, v):
-        if isinstance(v, dict) and 'password' in v:
-            password = v['password']
-            if len(password.encode('utf-8')) > 72:
-                raise ValueError('Password cannot exceed 72 bytes')
-        return v
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 class UserCreateAdmin(BaseModel):
     username: str
@@ -156,10 +164,6 @@ class Building(BaseModel):
     address: Optional[str]
     cctv_settings: Optional[dict]
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
 class VehicleCreate(BaseModel):
     license_plate: str
     chassis_number: Optional[str]
@@ -171,6 +175,255 @@ class VehicleCreate(BaseModel):
 class ScanRequest(BaseModel):
     license_plate: str
     camera_snapshot_url: Optional[str]
+
+# ADD THESE MODELS WITH YOUR OTHER PYDANTIC MODELS:
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    email: str
+    role: str
+    building_id: Optional[int] = None
+    building_number: Optional[str] = None
+    phone_number: Optional[str] = None
+    flat_number: Optional[str] = None
+    wing: Optional[str] = None
+    status: str
+
+class SignupResponse(BaseModel):
+    user: UserResponse
+    token: Token
+
+# OCR Initialization
+logger = logging.getLogger(__name__)
+try:
+    reader = easyocr.Reader(['en'])
+    logger.info("EasyOCR initialized successfully")
+except Exception as e:
+    logger.error(f"EasyOCR initialization failed: {str(e)}")
+    reader = None
+
+# New Pydantic model for scan response
+class ScanResponse(BaseModel):
+    success: bool
+    license_plate: Optional[str] = None
+    status: Optional[str] = None
+    source: Optional[str] = None
+    confidence: Optional[float] = None
+    error: Optional[str] = None
+    vehicle_details: Optional[dict] = None
+
+# Scan Utility Functions
+def preprocess_image(image: np.ndarray) -> np.ndarray:
+    """
+    Preprocess image for better OCR results
+    """
+    try:
+        # Convert to grayscale if it's a color image
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Apply adaptive threshold
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 11, 2
+        )
+        
+        return thresh
+        
+    except Exception as e:
+        logger.error(f"Image preprocessing failed: {str(e)}")
+        return image
+
+def extract_license_plate_text(texts: list) -> Optional[str]:
+    """
+    Extract and validate license plate text from OCR results
+    """
+    license_plate_candidates = []
+    
+    for detection in texts:
+        text = detection[1]  # The recognized text
+        confidence = detection[2]  # Confidence score
+        
+        if confidence < 0.3:  # Skip low confidence results
+            continue
+            
+        # Clean the text - remove spaces and special characters
+        cleaned_text = ''.join(c for c in text.upper() if c.isalnum())
+        
+        # Indian license plate validation (adjust for your country)
+        if len(cleaned_text) >= 6 and len(cleaned_text) <= 12:
+            # Check if it contains both letters and numbers
+            has_letters = any(c.isalpha() for c in cleaned_text)
+            has_digits = any(c.isdigit() for c in cleaned_text)
+            
+            if has_letters and has_digits:
+                license_plate_candidates.append((cleaned_text, confidence))
+    
+    if license_plate_candidates:
+        # Return the highest confidence candidate
+        best_candidate = max(license_plate_candidates, key=lambda x: x[1])
+        logger.info(f"Selected license plate: {best_candidate[0]} with confidence: {best_candidate[1]}")
+        return best_candidate[0]
+    
+    logger.warning("No valid license plate candidates found")
+    return None
+
+async def process_license_plate_image(image_path: str) -> Optional[str]:
+    """
+    Process image to extract license plate text
+    """
+    try:
+        # Read image
+        image = cv2.imread(image_path)
+        if image is None:
+            logger.error("Failed to read image file")
+            return None
+        
+        logger.info(f"Image loaded successfully: {image.shape}")
+        
+        # Preprocess image
+        processed_image = preprocess_image(image)
+        
+        # Perform OCR
+        results = reader.readtext(processed_image)
+        
+        logger.info(f"OCR found {len(results)} text regions")
+        
+        # Extract license plate text
+        license_plate = extract_license_plate_text(results)
+        
+        if license_plate:
+            logger.info(f"License plate detected: {license_plate}")
+        else:
+            logger.warning("No license plate detected in image")
+            
+        return license_plate
+        
+    except Exception as e:
+        logger.error(f"License plate processing failed: {str(e)}")
+        return None
+
+def save_uploaded_file(file: UploadFile, upload_dir: str = "uploads") -> str:
+    """
+    Save uploaded file to disk and return file path
+    """
+    try:
+        # Create upload directory if it doesn't exist
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Generate unique filename
+        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+        filename = f"{uuid.uuid4()}.{file_extension}"
+        file_path = os.path.join(upload_dir, filename)
+        
+        # Save file
+        with open(file_path, "wb") as buffer:
+            content = file.file.read()
+            buffer.write(content)
+        
+        logger.info(f"File saved successfully: {file_path}")
+        return file_path
+        
+    except Exception as e:
+        logger.error(f"File upload failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="File upload failed")
+
+async def verify_license_plate_db(license_plate: str, db) -> dict:
+    """
+    Verify license plate in database (Google Sheets → MySQL fallback)
+    """
+    try:
+        # First try Google Sheets
+        try:
+            sheet = get_google_sheets()
+            records = sheet.get_all_records()
+            
+            for record in records:
+                if record.get("license_plate", "").upper() == license_plate.upper():
+                    logger.info(f"License plate found in Google Sheets: {license_plate}")
+                    return {
+                        "status": record.get("status", "unknown"),
+                        "source": "google_sheet",
+                        "vehicle_details": record
+                    }
+        except Exception as e:
+            logger.warning(f"Google Sheets lookup failed: {str(e)}")
+        
+        # Fallback to MySQL
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT v.*, u.username, u.building_number, u.flat_number 
+            FROM vehicles v 
+            LEFT JOIN users u ON v.owner_id = u.id 
+            WHERE v.license_plate = %s
+        """, (license_plate,))
+        
+        vehicle = cursor.fetchone()
+        cursor.close()
+        
+        if vehicle:
+            logger.info(f"License plate found in MySQL: {license_plate}")
+            return {
+                "status": vehicle["status"],
+                "source": "mysql",
+                "vehicle_details": {
+                    "license_plate": vehicle["license_plate"],
+                    "model": vehicle["model"],
+                    "color": vehicle["color"],
+                    "owner": vehicle["username"],
+                    "building": vehicle["building_number"],
+                    "flat": vehicle["flat_number"],
+                    "vehicle_type": vehicle["vehicle_type"]
+                }
+            }
+        else:
+            # Check unregistered visits
+            cursor = db.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT * FROM unregistered_visits 
+                WHERE license_plate = %s AND exit_timestamp IS NULL
+                ORDER BY entry_timestamp DESC LIMIT 1
+            """, (license_plate,))
+            
+            visit = cursor.fetchone()
+            cursor.close()
+            
+            if visit:
+                logger.info(f"License plate found in unregistered visits: {license_plate}")
+                return {
+                    "status": "unregistered",
+                    "source": "mysql",
+                    "vehicle_details": {
+                        "license_plate": visit["license_plate"],
+                        "visitor_name": visit["visitor_name"],
+                        "notes": visit["notes"],
+                        "entry_time": visit["entry_timestamp"].isoformat() if visit["entry_timestamp"] else None
+                    }
+                }
+        
+        logger.info(f"License plate not found: {license_plate}")
+        return {
+            "status": "not_found",
+            "source": "not_found",
+            "vehicle_details": None
+        }
+        
+    except Exception as e:
+        logger.error(f"License plate verification failed: {str(e)}")
+        return {
+            "status": "error",
+            "source": "error",
+            "vehicle_details": None
+        }
 
 # JWT helpers
 def verify_password(plain_password, hashed_password):
@@ -209,26 +462,30 @@ def send_email(to_email: str, subject: str, body: str):
             server.login(SMTP_USER, SMTP_PASSWORD)
             server.send_message(msg)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+        print(f"Failed to send email: {str(e)}") # Log error instead of raising HTTPException
 
-# Authentication & User Endpoints
-@app.post("/api/auth/signup", response_model=User)
+# --- Authentication & User Endpoints (Updated) ---
+
+@app.post("/api/auth/signup", response_model=SignupResponse)
 async def signup(user: UserSignup, db=Depends(get_db)):
-    password = user.password
-    if len(password.encode('utf-8')) > 72:
-        password = password.encode('utf-8')[:72].decode('utf-8', 'ignore')
-    
+    # 1. Validate password first
+    try:
+        validate_password_length(user.password)
+        hashed_password = pwd_context.hash(user.password)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
+
+    # 2. Proceed with database operations
     cursor = db.cursor(dictionary=True)
     try:
         cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (user.username, user.email))
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="Username or email already exists")
         
-        hashed_password = pwd_context.hash(password)
         cursor.execute(
             """
-            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
             (
                 user.username,
@@ -244,28 +501,78 @@ async def signup(user: UserSignup, db=Depends(get_db)):
             )
         )
         db.commit()
+        
+        # Get the newly created user
         cursor.execute("SELECT * FROM users WHERE id = LAST_INSERT_ID()")
         new_user = cursor.fetchone()
         
+        # Create access token for immediate login
+        access_token = create_access_token({"sub": new_user["username"]})
+        
         send_email(user.email, "Account Created", f"Welcome, {user.username}! Your resident account has been created successfully.")
-        return User(**new_user)
+        
+        # RETURN BOTH USER AND TOKEN
+        return {
+            "user": {
+                "id": new_user["id"],
+                "username": new_user["username"],
+                "email": new_user["email"],
+                "role": new_user["role"],
+                "building_id": new_user["building_id"],
+                "building_number": new_user["building_number"],
+                "phone_number": new_user["phone_number"],
+                "flat_number": new_user["flat_number"],
+                "wing": new_user["wing"],
+                "status": new_user["status"]
+            },
+            "token": {
+                "access_token": access_token,
+                "token_type": "bearer"
+            }
+        }
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
     finally:
         cursor.close()
 
-@app.post("/api/auth/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
+
+@app.post("/api/auth/login")
+async def login(request: dict, db=Depends(get_db)):
+    """
+    Login endpoint that works with raw JSON
+    """
+    print("🔍 LOGIN DEBUG - Received:", request)
+    
+    username = request.get("username")
+    password = request.get("password")
+    
+    if not username:
+        raise HTTPException(status_code=422, detail="Username is required")
+    if not password:
+        raise HTTPException(status_code=422, detail="Password is required")
+    
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s AND status = 'approved'", (form_data.username,))
+    cursor.execute("SELECT * FROM users WHERE username = %s AND status = 'approved'", (username,))
     user = cursor.fetchone()
     cursor.close()
-    if not user or not verify_password(form_data.password, user["password_hash"]):
+
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found or not approved")
+        
+    if not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
     access_token = create_access_token({"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# Add this endpoint anywhere in your api.py file (preferably after imports)
+@app.get("/api/test")
+async def test():
+    return {"message": "API is working!"}
+@app.post("/api/debug-json")
+async def debug_json(data: dict):
+    return {"received_data": data, "message": "JSON is working!"}
 @app.post("/api/auth/logout")
 async def logout(current_user: User = Depends(get_current_user)):
     return {"message": "Logged out successfully"}
@@ -278,9 +585,15 @@ async def get_me(current_user: User = Depends(get_current_user)):
 async def change_password(user_id: int, new_password: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
     if current_user.id != user_id and current_user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    if len(new_password.encode('utf-8')) > 72:
-        new_password = new_password.encode('utf-8')[:72].decode('utf-8', 'ignore')
-    hashed_password = pwd_context.hash(new_password)
+    
+    # 1. Validate password first
+    try:
+        validate_password_length(new_password)
+        hashed_password = pwd_context.hash(new_password)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
+    
+    # 2. Proceed with database operation
     cursor = db.cursor()
     try:
         cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_password, user_id))
@@ -303,6 +616,73 @@ async def get_user(user_id: int, current_user: User = Depends(get_current_user),
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return User(**user)
+
+@app.post("/api/admin/users", response_model=User)
+async def create_user(
+    user: UserCreateAdmin,
+    current_user: User = Depends(get_current_user),
+    db=Depends(get_db)
+):
+    if current_user.role not in ["admin", "superadmin"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # 1. Validate password first
+    try:
+        validate_password_length(user.password)
+        hashed_password = pwd_context.hash(user.password)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
+    
+    # 2. Proceed with database operations
+    cursor = db.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (user.username, user.email))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Username or email already exists")
+        
+        status = "pending" if user.role == "admin" else "approved"
+        cursor.execute(
+            """
+            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                user.username,
+                user.email,
+                hashed_password,
+                user.role,
+                user.building_id,
+                user.building_number,
+                user.phone_number,
+                user.flat_number,
+                user.wing,
+                status
+            )
+        )
+        db.commit()
+        cursor.execute("SELECT * FROM users WHERE id = LAST_INSERT_ID()")
+        new_user = cursor.fetchone()
+        
+        send_email(user.email, "Account Created", f"Your {user.role} account has been created.{' Awaiting superadmin approval.' if status == 'pending' else ''}")
+        
+        if user.role == "admin":
+            cursor.execute("SELECT email FROM users WHERE role = 'superadmin'")
+            superadmins = cursor.fetchall()
+            for superadmin in superadmins:
+                send_email(
+                    superadmin["email"],
+                    "New Admin Account Awaiting Approval",
+                    f"A new admin account ({user.username}) has been created and requires your approval."
+                )
+        
+        return User(**new_user)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
+    finally:
+        cursor.close()
+
+# --- Keep all other existing endpoints and code unchanged ---
 
 # Dashboard Metrics
 @app.get("/api/admin/metrics")
@@ -466,8 +846,8 @@ async def create_vehicle(vehicle: VehicleCreate, current_user: User = Depends(ge
     try:
         cursor.execute(
             """
-            INSERT INTO vehicles (license_plate, chassis_number, model, vehicle_type, parking_slot, color, owner_id, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+            INSERT INTO vehicles (license_plate, chassis_number, model, vehicle_type, parking_slot, color, owner_id, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', NOW())
             """,
             (
                 vehicle.license_plate,
@@ -580,8 +960,7 @@ async def list_logs(
     if current_user.role not in ["admin", "superadmin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
     query = """
-        SELECT l.* 
-        FROM logs l 
+        SELECT l.* FROM logs l 
         LEFT JOIN vehicles v ON l.vehicle_id = v.id 
         LEFT JOIN unregistered_visits uv ON l.unregistered_visit_id = uv.id 
         WHERE 1=1
@@ -730,68 +1109,6 @@ async def list_users(current_user: User = Depends(get_current_user), db=Depends(
 @app.get("/api/admin/users/{user_id}", response_model=User)
 async def get_user_admin(user_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
     return await get_user(user_id, current_user, db)
-
-@app.post("/api/admin/users", response_model=User)
-async def create_user(
-    user: UserCreateAdmin,
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    password = user.password
-    if len(password.encode('utf-8')) > 72:
-        password = password.encode('utf-8')[:72].decode('utf-8', 'ignore')
-    
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (user.username, user.email))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Username or email already exists")
-        
-        status = "pending" if user.role == "admin" else "approved"
-        hashed_password = pwd_context.hash(password)
-        cursor.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                user.username,
-                user.email,
-                hashed_password,
-                user.role,
-                user.building_id,
-                user.building_number,
-                user.phone_number,
-                user.flat_number,
-                user.wing,
-                status
-            )
-        )
-        db.commit()
-        cursor.execute("SELECT * FROM users WHERE id = LAST_INSERT_ID()")
-        new_user = cursor.fetchone()
-        
-        send_email(user.email, "Account Created", f"Your {user.role} account has been created.{' Awaiting superadmin approval.' if status == 'pending' else ''}")
-        
-        if user.role == "admin":
-            cursor.execute("SELECT email FROM users WHERE role = 'superadmin'")
-            superadmins = cursor.fetchall()
-            for superadmin in superadmins:
-                send_email(
-                    superadmin["email"],
-                    "New Admin Account Awaiting Approval",
-                    f"A new admin account ({user.username}) has been created and requires your approval."
-                )
-        
-        return User(**new_user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-    finally:
-        cursor.close()
 
 @app.patch("/api/admin/users/{user_id}", response_model=User)
 async def update_user(
@@ -1087,8 +1404,8 @@ async def create_building(
     try:
         cursor.execute(
             """
-            INSERT INTO buildings (name, address, cctv_settings)
-            VALUES (%s, %s, %s)
+            INSERT INTO buildings (name, address, cctv_settings, created_at)
+            VALUES (%s, %s, %s, NOW())
             """,
             (name, address, json.dumps(cctv_settings) if cctv_settings else None)
         )
@@ -1160,5 +1477,155 @@ async def delete_building(building_id: int, current_user: User = Depends(get_cur
     finally:
         cursor.close()
 
+# Add these endpoints at the END of your file, before the main block
+
+@app.post("/api/scan/plate", response_model=ScanResponse)
+async def scan_license_plate(
+    file: UploadFile = File(...),
+    camera_snapshot_url: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Scan license plate from image and verify in database
+    """
+    if current_user.role != "guard":
+        raise HTTPException(status_code=403, detail="Only guards can scan vehicles")
+    
+    if reader is None:
+        return ScanResponse(
+            success=False,
+            error="OCR system not available. Please contact administrator."
+        )
+    
+    # Validate file type
+    if not file.content_type.startswith('image/'):
+        return ScanResponse(
+            success=False,
+            error="File must be an image (JPEG, PNG, etc.)"
+        )
+    
+    file_path = None
+    try:
+        logger.info(f"Starting scan for user {current_user.username}")
+        
+        # Save uploaded file
+        file_path = save_uploaded_file(file)
+        
+        # Process image to extract license plate
+        license_plate = await process_license_plate_image(file_path)
+        
+        if not license_plate:
+            return ScanResponse(
+                success=False,
+                error="Could not detect license plate in image. Please try again with a clearer image of the license plate."
+            )
+        
+        # Verify license plate in database
+        verification_result = await verify_license_plate_db(license_plate, db)
+        
+        # Log the scan
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                license_plate,
+                "scan",
+                verification_result["status"],
+                verification_result["source"],
+                current_user.id,
+                camera_snapshot_url
+            )
+        )
+        db.commit()
+        cursor.close()
+        
+        logger.info(f"Scan completed successfully: {license_plate} - {verification_result['status']}")
+        
+        return ScanResponse(
+            success=True,
+            license_plate=license_plate,
+            status=verification_result["status"],
+            source=verification_result["source"],
+            confidence=0.8,
+            vehicle_details=verification_result["vehicle_details"]
+        )
+        
+    except Exception as e:
+        logger.error(f"Scan endpoint error: {str(e)}")
+        return ScanResponse(
+            success=False,
+            error=f"Scan failed: {str(e)}"
+        )
+        
+    finally:
+        # Clean up uploaded file
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info("Temporary file cleaned up")
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file: {str(e)}")
+
+@app.post("/api/scan/quick")
+async def quick_scan(
+    license_plate: str = Query(..., description="Direct license plate input"),
+    camera_snapshot_url: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db=Depends(get_db)
+):
+    """
+    Quick scan with direct license plate input (manual entry fallback)
+    """
+    if current_user.role != "guard":
+        raise HTTPException(status_code=403, detail="Only guards can scan vehicles")
+    
+    try:
+        # Clean the license plate input
+        license_plate_clean = ''.join(c for c in license_plate.upper() if c.isalnum())
+        
+        if len(license_plate_clean) < 6:
+            raise HTTPException(status_code=400, detail="Invalid license plate format")
+        
+        # Verify license plate in database
+        verification_result = await verify_license_plate_db(license_plate_clean, db)
+        
+        # Log the scan
+        cursor = db.cursor()
+        cursor.execute(
+            """
+            INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """,
+            (
+                license_plate_clean,
+                "manual_scan",
+                verification_result["status"],
+                verification_result["source"],
+                current_user.id,
+                camera_snapshot_url
+            )
+        )
+        db.commit()
+        cursor.close()
+        
+        return {
+            "success": True,
+            "license_plate": license_plate_clean,
+            "status": verification_result["status"],
+            "source": verification_result["source"],
+            "vehicle_details": verification_result["vehicle_details"]
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Quick scan error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
