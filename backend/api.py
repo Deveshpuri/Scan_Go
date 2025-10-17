@@ -34,7 +34,7 @@ app = FastAPI()
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://monitor-renewing-oarfish.ngrok-free.app", "http://localhost:3000", "http://localhost:8000", "http://localhost:8081"],
+    allow_origins=["https://monitor-renewing-oarfish.ngrok-free.app",  "http://localhost:3000", "http://localhost:8000", "http://localhost:8081"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
