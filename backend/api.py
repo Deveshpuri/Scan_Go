@@ -1,1631 +1,1383 @@
-import os
-import mysql.connector
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, get_jwt
+from werkzeug.security import generate_password_hash, check_password_hash
+import bcrypt
 import json
-from fastapi import FastAPI, HTTPException, Depends, status, Query, UploadFile, File
-from fastapi.security import OAuth2PasswordBearer
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, validator
-from typing import Optional, List
-from jose import JWTError, jwt
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import logging
 import smtplib
 from email.mime.text import MIMEText
-import pandas as pd
-from io import StringIO
-import uvicorn
+from email.mime.multipart import MIMEMultipart
+import random
+from config import Config
 
-# Add these to your existing imports at the top
+# --- New Imports for OCR and Google Sheets ---
+import os
+import io
+import base64
 import cv2
 import numpy as np
-import easyocr
-import uuid
-import logging
+from PIL import Image
+import pytesseract
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import re
 
-# Load environment variables
-load_dotenv()
-
-# FastAPI app
-app = FastAPI()
-
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://monitor-renewing-oarfish.ngrok-free.app", "http://localhost:3000", "http://localhost:8000", "http://localhost:8081"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# MySQL connection
-def get_db():
-    conn = mysql.connector.connect(
-        host=os.getenv("DB_HOST"),
-        database=os.getenv("DB_DATABASE"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        port=int(os.getenv("DB_PORT"))
-    )
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-# SMTP configuration
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-# Google Sheets setup
-def get_google_sheets():
-    credentials = ServiceAccountCredentials.from_json_keyfile_dict(
-        eval(os.getenv("GOOGLE_SHEETS_CREDENTIALS")),
-        ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    )
-    client = gspread.authorize(credentials)
-    return client.open("VehicleRegistry").sheet1
-
-# JWT configuration
-SECRET_KEY = os.getenv("JWT_SECRET")
-ALGORITHM = os.getenv("JWT_ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-
-# --- Password Handling Function ---
-def validate_password_length(password: str):
-    """
-    Validates that the password does not exceed 72 bytes (bcrypt limit).
-    Raises ValueError with a clean message if it does.
-    """
-    if len(password.encode('utf-8')) > 72:
-        raise ValueError("Password cannot exceed 72 bytes. Please use a shorter password.")
-
-# Pydantic models
-class User(BaseModel):
-    id: int
-    username: str
-    email: str
-    role: str
-    building_id: Optional[int]
-    building_number: Optional[str]
-    phone_number: Optional[str]
-    flat_number: Optional[str]
-    wing: Optional[str]
-    status: str
-
-class UserSignup(BaseModel):
-    username: str
-    email: str
-    password: str
-    building_id: int
-    building_number: Optional[str] = None
-    phone_number: Optional[str] = None
-    flat_number: Optional[str] = None
-    wing: Optional[str] = None
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class UserCreateAdmin(BaseModel):
-    username: str
-    email: str
-    password: str
-    role: str
-    building_id: Optional[int]
-    building_number: Optional[str]
-    phone_number: Optional[str]
-    flat_number: Optional[str]
-    wing: Optional[str]
-
-class Vehicle(BaseModel):
-    id: int
-    license_plate: str
-    chassis_number: Optional[str]
-    model: Optional[str]
-    vehicle_type: Optional[str]
-    parking_slot: Optional[str]
-    color: Optional[str]
-    owner_id: int
-    status: str
-    approved_by: Optional[int]
-    approved_at: Optional[datetime]
-    rejected_reason: Optional[str]
-
-class Log(BaseModel):
-    id: int
-    vehicle_id: Optional[int]
-    unregistered_visit_id: Optional[int]
-    license_plate: Optional[str]
-    action: str
-    result: str
-    source: str
-    timestamp: datetime
-    guard_id: Optional[int]
-    notes: Optional[str]
-    snapshot_url: Optional[str]
-
-class Notification(BaseModel):
-    id: int
-    user_id: int
-    type: str
-    message: str
-    sent_at: datetime
-    is_read: bool
-
-class Building(BaseModel):
-    id: int
-    name: str
-    address: Optional[str]
-    cctv_settings: Optional[dict]
-
-class VehicleCreate(BaseModel):
-    license_plate: str
-    chassis_number: Optional[str]
-    model: Optional[str]
-    vehicle_type: Optional[str]
-    parking_slot: Optional[str]
-    color: Optional[str]
-
-class ScanRequest(BaseModel):
-    license_plate: str
-    camera_snapshot_url: Optional[str]
-
-# ADD THESE MODELS WITH YOUR OTHER PYDANTIC MODELS:
-class UserLogin(BaseModel):
-    username: str
-    password: str
-
-class UserResponse(BaseModel):
-    id: int
-    username: str
-    email: str
-    role: str
-    building_id: Optional[int] = None
-    building_number: Optional[str] = None
-    phone_number: Optional[str] = None
-    flat_number: Optional[str] = None
-    wing: Optional[str] = None
-    status: str
-
-class SignupResponse(BaseModel):
-    user: UserResponse
-    token: Token
-
-# OCR Initialization
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-try:
-    reader = easyocr.Reader(['en'])
-    logger.info("EasyOCR initialized successfully")
-except Exception as e:
-    logger.error(f"EasyOCR initialization failed: {str(e)}")
-    reader = None
 
-# New Pydantic model for scan response
-class ScanResponse(BaseModel):
-    success: bool
-    license_plate: Optional[str] = None
-    status: Optional[str] = None
-    source: Optional[str] = None
-    confidence: Optional[float] = None
-    error: Optional[str] = None
-    vehicle_details: Optional[dict] = None
+app = Flask(__name__)
+app.config.from_object(Config)
 
-# Scan Utility Functions
-def preprocess_image(image: np.ndarray) -> np.ndarray:
-    """
-    Preprocess image for better OCR results
-    """
+# Initialize extensions
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+
+# Store OTPs temporarily (in production, use Redis or a similar cache)
+otp_storage = {}
+
+# --- Database Models ---
+class Admin(db.Model):
+    __tablename__ = 'admins'
+    id = db.Column(db.Integer, primary_key=True)
+    user_name = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(191), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    phone_number = db.Column(db.String(50), nullable=False)
+    building_id = db.Column(db.Integer, db.ForeignKey('buildings.id'))
+    status = db.Column(db.Enum('pending', 'approved'), default='pending')
+    google_credentials = db.Column(db.Text) # For Google Sheets API
+    created_at = db.Column(db.DateTime, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Guard(db.Model):
+    __tablename__ = 'guards'
+    id = db.Column(db.Integer, primary_key=True)
+    user_name = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(191), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    phone_number = db.Column(db.String(50), nullable=False)
+    building_id = db.Column(db.Integer, db.ForeignKey('buildings.id'))
+    status = db.Column(db.Enum('active', 'inactive'), default='active')
+    created_at = db.Column(db.DateTime, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Resident(db.Model):
+    __tablename__ = 'residents'
+    id = db.Column(db.Integer, primary_key=True)
+    user_name = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(191), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    phone_number = db.Column(db.String(50), nullable=False)
+    building_id = db.Column(db.Integer, db.ForeignKey('buildings.id'), nullable=False)
+    building_number = db.Column(db.String(50), nullable=False)
+    flat_number = db.Column(db.String(50), nullable=False)
+    wing = db.Column(db.String(50))
+    status = db.Column(db.Enum('pending', 'approved'), default='approved')
+    created_at = db.Column(db.DateTime, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Building(db.Model):
+    __tablename__ = 'buildings'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    address = db.Column(db.Text)
+    cctv_settings = db.Column(db.Text)
+    google_sheet_id = db.Column(db.String(255))  # New column
+    admin_id = db.Column(db.Integer, db.ForeignKey('admins.id'))  # New column
+    created_at = db.Column(db.DateTime, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    # Relationship
+    admin = db.relationship('Admin', backref='buildings', foreign_keys=[admin_id])
+
+
+class Vehicle(db.Model):
+    __tablename__ = 'vehicles'
+    id = db.Column(db.Integer, primary_key=True)
+    license_plate = db.Column(db.String(50), unique=True, nullable=False)
+    chassis_number = db.Column(db.String(100))
+    model = db.Column(db.String(100))
+    vehicle_type = db.Column(db.Enum('2_wheeler', '3_wheeler', '4_wheeler'))
+    parking_slot = db.Column(db.String(50))
+    color = db.Column(db.String(50))
+    registration_image = db.Column(db.String(500))
+    vehicle_image = db.Column(db.String(500))
+    owner_type = db.Column(db.Enum('resident', 'rental'), nullable=False)
+    owner_name = db.Column(db.String(100), nullable=False)
+    status = db.Column(db.Enum('pending', 'approved', 'rejected'), default='pending')
+    approved_by_admin_id = db.Column(db.Integer, db.ForeignKey('admins.id'))
+    approved_at = db.Column(db.DateTime)
+    rejected_reason = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Log(db.Model):
+    __tablename__ = 'logs'
+    id = db.Column(db.Integer, primary_key=True)
+    vehicle_id = db.Column(db.Integer, db.ForeignKey('vehicles.id'))
+    unregistered_visit_id = db.Column(db.Integer, db.ForeignKey('unregistered_visits.id'))
+    license_plate = db.Column(db.String(50))
+    action = db.Column(db.Enum('scan', 'verification', 'entry', 'exit', 'manual_entry'), nullable=False)
+    result = db.Column(db.Enum('registered', 'not_found', 'pending', 'unregistered', 'approved'), nullable=False)
+    source = db.Column(db.Enum('google_sheet', 'mysql', 'not_found'), nullable=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    guard_id = db.Column(db.Integer, db.ForeignKey('guards.id'))
+    notes = db.Column(db.Text)
+    snapshot_url = db.Column(db.String(500))
+    captured_image = db.Column(db.String(500))
+
+class UnregisteredVisit(db.Model):
+    __tablename__ = 'unregistered_visits'
+    id = db.Column(db.Integer, primary_key=True)
+    license_plate = db.Column(db.String(50), nullable=False)
+    visitor_name = db.Column(db.String(255))
+    visitor_email = db.Column(db.String(255))
+    visited_resident_id = db.Column(db.Integer, db.ForeignKey('residents.id'))
+    entry_timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    exit_timestamp = db.Column(db.DateTime)
+    guard_id = db.Column(db.Integer, db.ForeignKey('guards.id'))
+    notes = db.Column(db.Text)
+    vehicle_image = db.Column(db.String(500))
+    building_id = db.Column(db.Integer, db.ForeignKey('buildings.id'), nullable=False)
+
+class Notification(db.Model):
+    __tablename__ = 'notifications'
+    id = db.Column(db.Integer, primary_key=True)
+    user_type = db.Column(db.Enum('resident', 'rental', 'admin', 'guard', 'superadmin'), nullable=False)
+    user_id = db.Column(db.Integer, nullable=False)
+    type = db.Column(db.Enum('approval', 'rejection', 'suspicious_activity'), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    sent_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_read = db.Column(db.Boolean, default=False)
+
+
+# --- Utility Functions ---
+def check_password(password_hash, password):
+    """Check password against hash"""
     try:
-        # Convert to grayscale if it's a color image
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    except Exception as e:
+        logger.error(f"Password check error: {str(e)}")
+        return False
+
+def hash_password(password):
+    """Hash password using bcrypt"""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def generate_otp():
+    """Generate a 6-digit OTP"""
+    return str(random.randint(100000, 999999))
+
+def send_otp_email(email, otp):
+    """Send OTP via email"""
+    try:
+        message = MIMEMultipart()
+        message['From'] = app.config['SMTP_USER']
+        message['To'] = email
+        message['Subject'] = 'Your OTP Code'
         
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        body = f"Your OTP code for vehicle access system is: {otp}\n\nThis OTP will expire in 10 minutes."
+        message.attach(MIMEText(body, 'plain'))
         
-        # Apply adaptive threshold
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
+        with smtplib.SMTP(app.config['SMTP_HOST'], app.config['SMTP_PORT']) as server:
+            server.starttls()
+            server.login(app.config['SMTP_USER'], app.config['SMTP_PASSWORD'])
+            server.send_message(message)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Email sending error: {str(e)}")
+        return False
+
+def create_notification(user_type, user_id, notification_type, message):
+    """Create a new notification"""
+    try:
+        notification = Notification(
+            user_type=user_type,
+            user_id=user_id,
+            type=notification_type,
+            message=message
         )
+        db.session.add(notification)
+        db.session.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Notification creation error: {str(e)}")
+        db.session.rollback()
+        return False
+
+# --- OCR & Google Sheets Functionality ---
+
+# OCR Configuration
+def preprocess_image(image_data):
+    """Preprocess image for better OCR results"""
+    try:
+        # Convert base64 to image if needed
+        if isinstance(image_data, str) and image_data.startswith('data:image'):
+            # Extract base64 data from data URL
+            image_data = image_data.split(',')[1]
+        
+        # Decode base64 to bytes
+        image_bytes = base64.b64decode(image_data)
+        
+        # Convert to numpy array
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply noise reduction
+        denoised = cv2.medianBlur(gray, 5)
+        
+        # Apply thresholding
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
         return thresh
-        
     except Exception as e:
-        logger.error(f"Image preprocessing failed: {str(e)}")
-        return image
-
-def extract_license_plate_text(texts: list) -> Optional[str]:
-    """
-    Extract and validate license plate text from OCR results
-    """
-    license_plate_candidates = []
-    
-    for detection in texts:
-        text = detection[1]  # The recognized text
-        confidence = detection[2]  # Confidence score
-        
-        if confidence < 0.3:  # Skip low confidence results
-            continue
-            
-        # Clean the text - remove spaces and special characters
-        cleaned_text = ''.join(c for c in text.upper() if c.isalnum())
-        
-        # Indian license plate validation (adjust for your country)
-        if len(cleaned_text) >= 6 and len(cleaned_text) <= 12:
-            # Check if it contains both letters and numbers
-            has_letters = any(c.isalpha() for c in cleaned_text)
-            has_digits = any(c.isdigit() for c in cleaned_text)
-            
-            if has_letters and has_digits:
-                license_plate_candidates.append((cleaned_text, confidence))
-    
-    if license_plate_candidates:
-        # Return the highest confidence candidate
-        best_candidate = max(license_plate_candidates, key=lambda x: x[1])
-        logger.info(f"Selected license plate: {best_candidate[0]} with confidence: {best_candidate[1]}")
-        return best_candidate[0]
-    
-    logger.warning("No valid license plate candidates found")
-    return None
-
-async def process_license_plate_image(image_path: str) -> Optional[str]:
-    """
-    Process image to extract license plate text
-    """
-    try:
-        # Read image
-        image = cv2.imread(image_path)
-        if image is None:
-            logger.error("Failed to read image file")
-            return None
-        
-        logger.info(f"Image loaded successfully: {image.shape}")
-        
-        # Preprocess image
-        processed_image = preprocess_image(image)
-        
-        # Perform OCR
-        results = reader.readtext(processed_image)
-        
-        logger.info(f"OCR found {len(results)} text regions")
-        
-        # Extract license plate text
-        license_plate = extract_license_plate_text(results)
-        
-        if license_plate:
-            logger.info(f"License plate detected: {license_plate}")
-        else:
-            logger.warning("No license plate detected in image")
-            
-        return license_plate
-        
-    except Exception as e:
-        logger.error(f"License plate processing failed: {str(e)}")
+        logger.error(f"Image preprocessing error: {str(e)}")
         return None
 
-def save_uploaded_file(file: UploadFile, upload_dir: str = "uploads") -> str:
-    """
-    Save uploaded file to disk and return file path
-    """
+def extract_license_plate(image_data):
+    """Extract license plate number from image using OCR"""
     try:
-        # Create upload directory if it doesn't exist
-        os.makedirs(upload_dir, exist_ok=True)
+        processed_image = preprocess_image(image_data)
+        if processed_image is None:
+            return None, "Image processing failed"
         
-        # Generate unique filename
-        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-        filename = f"{uuid.uuid4()}.{file_extension}"
-        file_path = os.path.join(upload_dir, filename)
+        # Configure Tesseract for license plates
+        custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         
-        # Save file
-        with open(file_path, "wb") as buffer:
-            content = file.file.read()
-            buffer.write(content)
+        # Extract text
+        text = pytesseract.image_to_string(processed_image, config=custom_config)
         
-        logger.info(f"File saved successfully: {file_path}")
-        return file_path
+        # Clean and validate license plate
+        license_plate = clean_license_plate(text)
         
-    except Exception as e:
-        logger.error(f"File upload failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="File upload failed")
-
-async def verify_license_plate_db(license_plate: str, db) -> dict:
-    """
-    Verify license plate in database (Google Sheets → MySQL fallback)
-    """
-    try:
-        # First try Google Sheets
-        try:
-            sheet = get_google_sheets()
-            records = sheet.get_all_records()
-            
-            for record in records:
-                if record.get("license_plate", "").upper() == license_plate.upper():
-                    logger.info(f"License plate found in Google Sheets: {license_plate}")
-                    return {
-                        "status": record.get("status", "unknown"),
-                        "source": "google_sheet",
-                        "vehicle_details": record
-                    }
-        except Exception as e:
-            logger.warning(f"Google Sheets lookup failed: {str(e)}")
-        
-        # Fallback to MySQL
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT v.*, u.username, u.building_number, u.flat_number 
-            FROM vehicles v 
-            LEFT JOIN users u ON v.owner_id = u.id 
-            WHERE v.license_plate = %s
-        """, (license_plate,))
-        
-        vehicle = cursor.fetchone()
-        cursor.close()
-        
-        if vehicle:
-            logger.info(f"License plate found in MySQL: {license_plate}")
-            return {
-                "status": vehicle["status"],
-                "source": "mysql",
-                "vehicle_details": {
-                    "license_plate": vehicle["license_plate"],
-                    "model": vehicle["model"],
-                    "color": vehicle["color"],
-                    "owner": vehicle["username"],
-                    "building": vehicle["building_number"],
-                    "flat": vehicle["flat_number"],
-                    "vehicle_type": vehicle["vehicle_type"]
-                }
-            }
+        if license_plate:
+            return license_plate, "License plate extracted successfully"
         else:
-            # Check unregistered visits
-            cursor = db.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT * FROM unregistered_visits 
-                WHERE license_plate = %s AND exit_timestamp IS NULL
-                ORDER BY entry_timestamp DESC LIMIT 1
-            """, (license_plate,))
+            return None, "No valid license plate found in image"
             
-            visit = cursor.fetchone()
-            cursor.close()
-            
-            if visit:
-                logger.info(f"License plate found in unregistered visits: {license_plate}")
+    except Exception as e:
+        logger.error(f"OCR extraction error: {str(e)}")
+        return None, f"OCR processing error: {str(e)}"
+
+def clean_license_plate(text):
+    """Clean and validate license plate format"""
+    if not text:
+        return None
+    
+    # Remove unwanted characters and whitespace
+    cleaned = re.sub(r'[^A-Z0-9]', '', text.upper().strip())
+    
+    # Basic validation for Indian license plates
+    # Format: XX00XX0000 or similar variations
+    if len(cleaned) >= 6 and len(cleaned) <= 10:
+        # Check if it has both letters and numbers
+        has_letters = any(c.isalpha() for c in cleaned)
+        has_numbers = any(c.isdigit() for c in cleaned)
+        
+        if has_letters and has_numbers:
+            return cleaned
+    
+    return None
+
+# Google Sheets Integration
+def get_google_sheets_service(admin_id):
+    """Get Google Sheets service for admin"""
+    try:
+        # In production, store credentials in database
+        admin = Admin.query.get(admin_id)
+        if not admin or not admin.google_credentials:
+            return None
+        
+        creds = Credentials.from_authorized_user_info(
+            json.loads(admin.google_credentials)
+        )
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+    except Exception as e:
+        logger.error(f"Google Sheets service error: {str(e)}")
+        return None
+
+def check_google_sheet(license_plate, building_id):
+    """Check license plate in Google Sheet"""
+    try:
+        building = Building.query.get(building_id)
+        if not building or not building.google_sheet_id:
+            return None
+        
+        # Get admin for this building
+        admin = Admin.query.get(building.admin_id)
+        if not admin:
+            return None
+        
+        service = get_google_sheets_service(admin.id)
+        if not service:
+            return None
+        
+        # Read data from Google Sheet
+        sheet = service.spreadsheets()
+        result = sheet.values().get(
+            spreadsheetId=building.google_sheet_id,
+            range='A:Z'  # Adjust range as needed
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        # Search for license plate
+        for row in values:
+            if row and license_plate.upper() in [str(cell).upper() for cell in row]:
                 return {
-                    "status": "unregistered",
-                    "source": "mysql",
-                    "vehicle_details": {
-                        "license_plate": visit["license_plate"],
-                        "visitor_name": visit["visitor_name"],
-                        "notes": visit["notes"],
-                        "entry_time": visit["entry_timestamp"].isoformat() if visit["entry_timestamp"] else None
-                    }
+                    'found': True,
+                    'source': 'google_sheet',
+                    'data': row
                 }
         
-        logger.info(f"License plate not found: {license_plate}")
-        return {
-            "status": "not_found",
-            "source": "not_found",
-            "vehicle_details": None
-        }
+        return {'found': False, 'source': 'google_sheet'}
         
     except Exception as e:
-        logger.error(f"License plate verification failed: {str(e)}")
-        return {
-            "status": "error",
-            "source": "error",
-            "vehicle_details": None
-        }
+        logger.error(f"Google Sheet check error: {str(e)}")
+        return None
 
-# JWT helpers
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def create_access_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-async def get_current_user(token: str = Depends(oauth2_scheme), db=Depends(get_db)):
+def verify_license_plate(license_plate, building_id):
+    """Two-layer verification: Google Sheet -> MySQL"""
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM users WHERE username = %s AND status = 'approved'", (username,))
-        user = cursor.fetchone()
-        cursor.close()
-        if user is None:
-            raise HTTPException(status_code=401, detail="User not found or not approved")
-        return User(**user)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def send_email(to_email: str, subject: str, body: str):
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = to_email
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-    except Exception as e:
-        print(f"Failed to send email: {str(e)}") # Log error instead of raising HTTPException
-
-# --- Authentication & User Endpoints (Updated) ---
-
-@app.post("/api/auth/signup", response_model=SignupResponse)
-async def signup(user: UserSignup, db=Depends(get_db)):
-    # 1. Validate password first
-    try:
-        validate_password_length(user.password)
-        hashed_password = pwd_context.hash(user.password)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
-
-    # 2. Proceed with database operations
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (user.username, user.email))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Username or email already exists")
+        # First check Google Sheet
+        google_result = check_google_sheet(license_plate, building_id)
         
-        cursor.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                user.username,
-                user.email,
-                hashed_password,
-                "resident",
-                user.building_id,
-                user.building_number,
-                user.phone_number,
-                user.flat_number,
-                user.wing,
-                "approved"
-            )
-        )
-        db.commit()
-        
-        # Get the newly created user
-        cursor.execute("SELECT * FROM users WHERE id = LAST_INSERT_ID()")
-        new_user = cursor.fetchone()
-        
-        # Create access token for immediate login
-        access_token = create_access_token({"sub": new_user["username"]})
-        
-        send_email(user.email, "Account Created", f"Welcome, {user.username}! Your resident account has been created successfully.")
-        
-        # RETURN BOTH USER AND TOKEN
-        return {
-            "user": {
-                "id": new_user["id"],
-                "username": new_user["username"],
-                "email": new_user["email"],
-                "role": new_user["role"],
-                "building_id": new_user["building_id"],
-                "building_number": new_user["building_number"],
-                "phone_number": new_user["phone_number"],
-                "flat_number": new_user["flat_number"],
-                "wing": new_user["wing"],
-                "status": new_user["status"]
-            },
-            "token": {
-                "access_token": access_token,
-                "token_type": "bearer"
+        if google_result and google_result.get('found'):
+            return {
+                'status': 'registered',  # Changed from 'approved' to match your Log enum
+                'source': 'google_sheet',
+                'data': google_result.get('data')
             }
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-    finally:
-        cursor.close()
-
-
-@app.post("/api/auth/login")
-async def login(request: dict, db=Depends(get_db)):
-    """
-    Login endpoint that works with raw JSON
-    """
-    print("🔍 LOGIN DEBUG - Received:", request)
-    
-    username = request.get("username")
-    password = request.get("password")
-    
-    if not username:
-        raise HTTPException(status_code=422, detail="Username is required")
-    if not password:
-        raise HTTPException(status_code=422, detail="Password is required")
-    
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE username = %s AND status = 'approved'", (username,))
-    user = cursor.fetchone()
-    cursor.close()
-
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found or not approved")
         
-    if not verify_password(password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    access_token = create_access_token({"sub": user["username"]})
-    return {"access_token": access_token, "token_type": "bearer"}
-
-# Add this endpoint anywhere in your api.py file (preferably after imports)
-@app.get("/api/test")
-async def test():
-    return {"message": "API is working!"}
-@app.post("/api/debug-json")
-async def debug_json(data: dict):
-    return {"received_data": data, "message": "JSON is working!"}
-@app.post("/api/auth/logout")
-async def logout(current_user: User = Depends(get_current_user)):
-    return {"message": "Logged out successfully"}
-
-@app.get("/api/auth/me", response_model=User)
-async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
-
-@app.patch("/api/users/{user_id}/password")
-async def change_password(user_id: int, new_password: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.id != user_id and current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # 1. Validate password first
-    try:
-        validate_password_length(new_password)
-        hashed_password = pwd_context.hash(new_password)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
-    
-    # 2. Proceed with database operation
-    cursor = db.cursor()
-    try:
-        cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (hashed_password, user_id))
-        db.commit()
-        return {"message": "Password updated"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating password: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.get("/api/users/{user_id}", response_model=User)
-async def get_user(user_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "guard", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-    user = cursor.fetchone()
-    cursor.close()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    return User(**user)
-
-@app.post("/api/admin/users", response_model=User)
-async def create_user(
-    user: UserCreateAdmin,
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # 1. Validate password first
-    try:
-        validate_password_length(user.password)
-        hashed_password = pwd_context.hash(user.password)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Password cannot exceed 72 bytes. Please use a shorter password.")
-    
-    # 2. Proceed with database operations
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT id FROM users WHERE username = %s OR email = %s", (user.username, user.email))
-        if cursor.fetchone():
-            raise HTTPException(status_code=400, detail="Username or email already exists")
+        # If not found in Google Sheet, check MySQL
+        vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        if vehicle:
+            return {
+                'status': vehicle.status,  # 'approved', 'pending', or 'rejected'
+                'source': 'mysql',
+                'vehicle_id': vehicle.id,
+                'data': {
+                    'owner_name': vehicle.owner_name,
+                    'model': vehicle.model,
+                    'vehicle_type': vehicle.vehicle_type
+                }
+            }
         
-        status = "pending" if user.role == "admin" else "approved"
-        cursor.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role, building_id, building_number, phone_number, flat_number, wing, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                user.username,
-                user.email,
-                hashed_password,
-                user.role,
-                user.building_id,
-                user.building_number,
-                user.phone_number,
-                user.flat_number,
-                user.wing,
-                status
+        return {'status': 'not_found', 'source': 'mysql'}
+    
+    except Exception as e:
+        logger.error(f"License plate verification error: {str(e)}")
+        return {'status': 'not_found', 'source': 'error'}
+
+# --- Health & Debugging Endpoints ---
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}), 200
+
+@app.route('/test-db', methods=['GET'])
+def test_db():
+    try:
+        db.session.execute('SELECT 1')
+        return jsonify({'message': 'Database connection successful'}), 200
+    except Exception as e:
+        logger.error(f"Database test error: {str(e)}")
+        return jsonify({'error': f'Database connection failed: {str(e)}'}), 500
+
+
+# --- Error Handlers ---
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Resource not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+# --- AUTH APIs ---
+@app.route('/auth/admin/login', methods=['POST'])
+def admin_login():
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not email or not password:
+            return jsonify({'error': 'Email and password required'}), 400
+        
+        admin = Admin.query.filter_by(email=email, status='approved').first()
+        if admin and check_password(admin.password_hash, password):
+            additional_claims = {'role': 'admin', 'building_id': admin.building_id, 'user_name': admin.user_name}
+            access_token = create_access_token(
+                identity=admin.id,
+                additional_claims=additional_claims
             )
-        )
-        db.commit()
-        cursor.execute("SELECT * FROM users WHERE id = LAST_INSERT_ID()")
-        new_user = cursor.fetchone()
+            return jsonify({
+                'message': 'Login successful',
+                'access_token': access_token,
+                'user': {
+                    'id': admin.id,
+                    'user_name': admin.user_name,
+                    'email': admin.email,
+                    'role': 'admin',
+                    'building_id': admin.building_id
+                }
+            }), 200
+        else:
+            return jsonify({'error': 'Invalid credentials or account not approved'}), 401
+            
+    except Exception as e:
+        logger.error(f"Admin login error: {str(e)}")
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/auth/guard/login', methods=['POST'])
+def guard_login():
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
         
-        send_email(user.email, "Account Created", f"Your {user.role} account has been created.{' Awaiting superadmin approval.' if status == 'pending' else ''}")
+        if not email or not password:
+            return jsonify({'error': 'Email and password required'}), 400
         
-        if user.role == "admin":
-            cursor.execute("SELECT email FROM users WHERE role = 'superadmin'")
-            superadmins = cursor.fetchall()
-            for superadmin in superadmins:
-                send_email(
-                    superadmin["email"],
-                    "New Admin Account Awaiting Approval",
-                    f"A new admin account ({user.username}) has been created and requires your approval."
-                )
+        guard = Guard.query.filter_by(email=email, status='active').first()
+        if guard and check_password(guard.password_hash, password):
+            additional_claims = {'role': 'guard', 'building_id': guard.building_id, 'user_name': guard.user_name}
+            access_token = create_access_token(
+                identity=guard.id,
+                additional_claims=additional_claims
+            )
+            return jsonify({
+                'message': 'Login successful',
+                'access_token': access_token,
+                'user': {
+                    'id': guard.id,
+                    'user_name': guard.user_name,
+                    'email': guard.email,
+                    'building_id': guard.building_id,
+                    'role': 'guard'
+                }
+            }), 200
+        else:
+            return jsonify({'error': 'Invalid credentials or account inactive'}), 401
+            
+    except Exception as e:
+        logger.error(f"Guard login error: {str(e)}")
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/auth/user/login', methods=['POST'])
+def user_login():
+    """User login with phone number or email, sends OTP."""
+    try:
+        data = request.get_json()
+        phone_number = data.get('phone_number')
+        email = data.get('email')
         
-        return User(**new_user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating user: {str(e)}")
-    finally:
-        cursor.close()
-
-# --- Keep all other existing endpoints and code unchanged ---
-
-# Dashboard Metrics
-@app.get("/api/admin/metrics")
-async def get_metrics(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT COUNT(*) as total_vehicles FROM vehicles")
-        total_vehicles = cursor.fetchone()["total_vehicles"]
-        cursor.execute("""
-            SELECT COUNT(*) as currently_inside 
-            FROM logs 
-            WHERE action = 'entry' 
-            AND id NOT IN (SELECT id FROM logs WHERE action = 'exit')
-        """)
-        currently_inside = cursor.fetchone()["currently_inside"]
-        cursor.execute("SELECT COUNT(*) as pending_requests FROM vehicles WHERE status = 'pending'")
-        pending_requests = cursor.fetchone()["pending_requests"]
-        cursor.execute("""
-            SELECT v.*, l.action, l.timestamp 
-            FROM vehicles v 
-            LEFT JOIN logs l ON v.id = l.vehicle_id 
-            ORDER BY v.created_at DESC LIMIT 10
-        """)
-        recent_requests = cursor.fetchall()
-        return {
-            "total_vehicles": total_vehicles,
-            "currently_inside": currently_inside,
-            "pending_requests": pending_requests,
-            "recent_requests": recent_requests
-        }
-    finally:
-        cursor.close()
-
-# Vehicles
-@app.get("/api/admin/vehicles", response_model=List[Vehicle])
-async def list_vehicles(
-    status: Optional[str] = Query(None),
-    license_plate: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    query = "SELECT * FROM vehicles WHERE 1=1"
-    params = []
-    if status:
-        query += " AND status = %s"
-        params.append(status)
-    if license_plate:
-        query += " AND license_plate LIKE %s"
-        params.append(f"%{license_plate}%")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(query, params)
-    vehicles = cursor.fetchall()
-    cursor.close()
-    return [Vehicle(**v) for v in vehicles]
-
-@app.get("/api/admin/vehicles/{vehicle_id}", response_model=Vehicle)
-async def get_vehicle(vehicle_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM vehicles WHERE id = %s", (vehicle_id,))
-    vehicle = cursor.fetchone()
-    cursor.close()
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    return Vehicle(**vehicle)
-
-@app.patch("/api/admin/vehicles/{vehicle_id}/block")
-async def block_vehicle(vehicle_id: int, block: bool, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    status = "rejected" if block else "approved"
-    cursor = db.cursor()
-    try:
-        cursor.execute(
-            "UPDATE vehicles SET status = %s, approved_by = %s, approved_at = %s WHERE id = %s",
-            (status, current_user.id, datetime.utcnow(), vehicle_id)
-        )
-        db.commit()
-        return {"message": f"Vehicle {'blocked' if block else 'unblocked'}"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/admin/vehicles/{vehicle_id}/approve")
-async def approve_vehicle(vehicle_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM vehicles WHERE id = %s", (vehicle_id,))
-        vehicle = cursor.fetchone()
-        if not vehicle:
-            raise HTTPException(status_code=404, detail="Vehicle not found")
-        cursor.execute(
-            "UPDATE vehicles SET status = %s, approved_by = %s, approved_at = %s WHERE id = %s",
-            ("approved", current_user.id, datetime.utcnow(), vehicle_id)
-        )
-        db.commit()
-        cursor.execute("SELECT email FROM users WHERE id = %s", (vehicle["owner_id"],))
-        owner = cursor.fetchone()
-        if owner:
-            send_email(owner["email"], "Vehicle Approved", f"Your vehicle {vehicle['license_plate']} has been approved.")
-        return {"message": "Vehicle approved"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error approving vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/admin/vehicles/{vehicle_id}/reject")
-async def reject_vehicle(vehicle_id: int, reason: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM vehicles WHERE id = %s", (vehicle_id,))
-        vehicle = cursor.fetchone()
-        if not vehicle:
-            raise HTTPException(status_code=404, detail="Vehicle not found")
-        cursor.execute(
-            "UPDATE vehicles SET status = %s, approved_by = %s, approved_at = %s, rejected_reason = %s WHERE id = %s",
-            ("rejected", current_user.id, datetime.utcnow(), reason, vehicle_id)
-        )
-        db.commit()
-        cursor.execute("SELECT email FROM users WHERE id = %s", (vehicle["owner_id"],))
-        owner = cursor.fetchone()
-        if owner:
-            send_email(owner["email"], "Vehicle Rejected", f"Your vehicle {vehicle['license_plate']} was rejected: {reason}")
-        return {"message": "Vehicle rejected"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error rejecting vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.get("/api/admin/vehicles/{vehicle_id}/qr")
-async def get_vehicle_qr(vehicle_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT license_plate FROM vehicles WHERE id = %s", (vehicle_id,))
-    vehicle = cursor.fetchone()
-    cursor.close()
-    if not vehicle:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    qr_data = f"vehicle:{vehicle['license_plate']}"
-    return {"qr_data": qr_data}
-
-@app.post("/api/resident/vehicles", response_model=Vehicle)
-async def create_vehicle(vehicle: VehicleCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "resident":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            """
-            INSERT INTO vehicles (license_plate, chassis_number, model, vehicle_type, parking_slot, color, owner_id, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', NOW())
-            """,
-            (
-                vehicle.license_plate,
-                vehicle.chassis_number,
-                vehicle.model,
-                vehicle.vehicle_type,
-                vehicle.parking_slot,
-                vehicle.color,
-                current_user.id
-            )
-        )
-        db.commit()
-        cursor.execute("SELECT * FROM vehicles WHERE id = LAST_INSERT_ID()")
-        new_vehicle = cursor.fetchone()
-        cursor.execute("SELECT email FROM users WHERE role IN ('admin', 'superadmin')")
-        admins = cursor.fetchall()
-        for admin in admins:
-            send_email(admin["email"], "New Vehicle Request", f"New vehicle {vehicle.license_plate} awaiting approval.")
-        return Vehicle(**new_vehicle)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/resident/vehicles/{vehicle_id}", response_model=Vehicle)
-async def update_vehicle(vehicle_id: int, vehicle: VehicleCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "resident":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM vehicles WHERE id = %s AND owner_id = %s", (vehicle_id, current_user.id))
-        existing_vehicle = cursor.fetchone()
-        if not existing_vehicle:
-            raise HTTPException(status_code=404, detail="Vehicle not found or not owned")
-        cursor.execute(
-            """
-            UPDATE vehicles 
-            SET license_plate = %s, chassis_number = %s, model = %s, vehicle_type = %s, 
-                parking_slot = %s, color = %s, status = 'pending'
-            WHERE id = %s
-            """,
-            (
-                vehicle.license_plate,
-                vehicle.chassis_number,
-                vehicle.model,
-                vehicle.vehicle_type,
-                vehicle.parking_slot,
-                vehicle.color,
-                vehicle_id
-            )
-        )
-        db.commit()
-        cursor.execute("SELECT * FROM vehicles WHERE id = %s", (vehicle_id,))
-        updated_vehicle = cursor.fetchone()
-        return Vehicle(**updated_vehicle)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.delete("/api/resident/vehicles/{vehicle_id}")
-async def delete_vehicle(vehicle_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "resident":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("DELETE FROM vehicles WHERE id = %s AND owner_id = %s", (vehicle_id, current_user.id))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Vehicle not found or not owned")
-        db.commit()
-        return {"message": "Vehicle deleted"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting vehicle: {str(e)}")
-    finally:
-        cursor.close()
-
-# Vehicle Requests
-@app.get("/api/admin/requests", response_model=List[Vehicle])
-async def list_requests(status: Optional[str] = Query("pending"), current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM vehicles WHERE status = %s", (status,))
-    requests = cursor.fetchall()
-    cursor.close()
-    return [Vehicle(**r) for r in requests]
-
-@app.patch("/api/admin/requests/{request_id}/approve")
-async def approve_request(request_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    return await approve_vehicle(request_id, current_user, db)
-
-@app.patch("/api/admin/requests/{request_id}/reject")
-async def reject_request(request_id: int, reason: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    return await reject_vehicle(request_id, reason, current_user, db)
-
-# Logs / In-Out History
-@app.get("/api/admin/logs", response_model=List[Log])
-async def list_logs(
-    date_from: Optional[datetime] = Query(None),
-    date_to: Optional[datetime] = Query(None),
-    guard_id: Optional[int] = Query(None),
-    vehicle_id: Optional[int] = Query(None),
-    building_id: Optional[int] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    query = """
-        SELECT l.* FROM logs l 
-        LEFT JOIN vehicles v ON l.vehicle_id = v.id 
-        LEFT JOIN unregistered_visits uv ON l.unregistered_visit_id = uv.id 
-        WHERE 1=1
-    """
-    params = []
-    if date_from:
-        query += " AND l.timestamp >= %s"
-        params.append(date_from)
-    if date_to:
-        query += " AND l.timestamp <= %s"
-        params.append(date_to)
-    if guard_id:
-        query += " AND l.guard_id = %s"
-        params.append(guard_id)
-    if vehicle_id:
-        query += " AND l.vehicle_id = %s"
-        params.append(vehicle_id)
-    if building_id:
-        query += " AND (v.owner_id IN (SELECT id FROM users WHERE building_id = %s) OR uv.building_id = %s)"
-        params.extend([building_id, building_id])
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(query, params)
-    logs = cursor.fetchall()
-    cursor.close()
-    return [Log(**log) for log in logs]
-
-@app.get("/api/admin/logs/export")
-async def export_logs(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM logs")
-    logs = cursor.fetchall()
-    cursor.close()
-    df = pd.DataFrame(logs)
-    csv_buffer = StringIO()
-    df.to_csv(csv_buffer, index=False)
-    return {"csv_data": csv_buffer.getvalue()}
-
-@app.get("/api/guard/logs", response_model=List[Log])
-async def guard_logs(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "guard":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM logs WHERE guard_id = %s OR building_id = %s", (current_user.id, current_user.building_id))
-    logs = cursor.fetchall()
-    cursor.close()
-    return [Log(**log) for log in logs]
-
-@app.post("/api/guard/logs")
-async def create_manual_log(
-    license_plate: str,
-    visitor_name: Optional[str],
-    visitor_email: Optional[str],
-    notes: Optional[str],
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role != "guard":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            """
-            INSERT INTO unregistered_visits (license_plate, visitor_name, visitor_email, guard_id, building_id, notes)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (license_plate, visitor_name, visitor_email, current_user.id, current_user.building_id, notes)
-        )
-        db.commit()
-        cursor.execute("SELECT LAST_INSERT_ID() as id")
-        visit_id = cursor.fetchone()["id"]
-        cursor.execute(
-            """
-            INSERT INTO logs (unregistered_visit_id, license_plate, action, result, source, guard_id, notes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            (visit_id, license_plate, "manual_entry", "unregistered", "mysql", current_user.id, notes)
-        )
-        db.commit()
-        return {"message": "Manual log created"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating log: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.post("/api/scan")
-async def scan_vehicle(scan: ScanRequest, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "guard":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    license_plate = scan.license_plate
-    try:
-        sheet = get_google_sheets()
-        records = sheet.get_all_records()
-        for record in records:
-            if record["license_plate"] == license_plate:
-                cursor = db.cursor()
-                cursor.execute(
-                    """
-                    INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (license_plate, "scan", record["status"], "google_sheet", current_user.id, scan.camera_snapshot_url)
-                )
-                db.commit()
-                cursor.close()
-                return {"result": record["status"], "source": "google_sheet"}
-    except Exception:
-        cursor = db.cursor(dictionary=True)
-        try:
-            cursor.execute("SELECT * FROM vehicles WHERE license_plate = %s", (license_plate,))
-            vehicle = cursor.fetchone()
-            if vehicle:
-                result = vehicle["status"]
-                source = "mysql"
-            else:
-                result = "not_found"
-                source = "not_found"
-            cursor.execute(
-                """
-                INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (license_plate, "scan", result, source, current_user.id, scan.camera_snapshot_url)
-            )
-            db.commit()
-            return {"result": result, "source": source}
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=f"Error scanning vehicle: {str(e)}")
-        finally:
-            cursor.close()
-
-# Users
-@app.get("/api/admin/users", response_model=List[User])
-async def list_users(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users")
-    users = cursor.fetchall()
-    cursor.close()
-    return [User(**u) for u in users]
-
-@app.get("/api/admin/users/{user_id}", response_model=User)
-async def get_user_admin(user_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    return await get_user(user_id, current_user, db)
-
-@app.patch("/api/admin/users/{user_id}", response_model=User)
-async def update_user(
-    user_id: int,
-    username: Optional[str],
-    email: Optional[str],
-    role: Optional[str],
-    building_id: Optional[int],
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        user = cursor.fetchone()
+        if not phone_number and not email:
+            return jsonify({'error': 'Phone number or email required'}), 400
+        
+        user = None
+        if phone_number:
+            user = Resident.query.filter_by(phone_number=phone_number, status='approved').first()
+        elif email:
+            user = Resident.query.filter_by(email=email, status='approved').first()
+        
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        query = "UPDATE users SET "
-        params = []
-        if username:
-            query += "username = %s, "
-            params.append(username)
-        if email:
-            query += "email = %s, "
-            params.append(email)
-        if role:
-            query += "role = %s, "
-            params.append(role)
-        if building_id is not None:
-            query += "building_id = %s, "
-            params.append(building_id)
-        query = query.rstrip(", ") + " WHERE id = %s"
-        params.append(user_id)
-        cursor.execute(query, params)
-        db.commit()
-        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        updated_user = cursor.fetchone()
-        return User(**updated_user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating user: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.delete("/api/admin/users/{user_id}")
-async def delete_user(user_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="User not found")
-        db.commit()
-        return {"message": "User deleted"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting user: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/superadmin/users/{user_id}/approve", response_model=User)
-async def approve_user(user_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "superadmin":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM users WHERE id = %s AND role = 'admin' AND status = 'pending'", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            raise HTTPException(status_code=404, detail="Pending admin user not found")
+            return jsonify({'error': 'User not found or not approved'}), 404
         
-        cursor.execute("UPDATE users SET status = 'approved' WHERE id = %s", (user_id,))
-        db.commit()
-        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        updated_user = cursor.fetchone()
-        
-        send_email(user["email"], "Admin Account Approved", f"Your admin account ({user['username']}) has been approved by the superadmin.")
-        return User(**updated_user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error approving user: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/superadmin/users/{user_id}/reject")
-async def reject_user(user_id: int, reason: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role != "superadmin":
-        raise HTTPException(status_code=403, detail="Not authorized")
-    
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM users WHERE id = %s AND role = 'admin' AND status = 'pending'", (user_id,))
-        user = cursor.fetchone()
-        if not user:
-            raise HTTPException(status_code=404, detail="Pending admin user not found")
-        
-        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
-        db.commit()
-        
-        send_email(user["email"], "Admin Account Rejected", f"Your admin account ({user['username']}) was rejected: {reason}")
-        return {"message": "Admin account rejected and deleted"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error rejecting user: {str(e)}")
-    finally:
-        cursor.close()
-
-# Guards
-@app.get("/api/admin/guards", response_model=List[User])
-async def list_guards(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM users WHERE role = 'guard'")
-    guards = cursor.fetchall()
-    cursor.close()
-    return [User(**g) for g in guards]
-
-@app.post("/api/admin/guards", response_model=User)
-async def create_guard(
-    username: str,
-    email: str,
-    password: str,
-    building_id: Optional[int],
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    return await create_user(
-        UserCreateAdmin(
-            username=username,
-            email=email,
-            password=password,
-            role="guard",
-            building_id=building_id
-        ),
-        current_user,
-        db
-    )
-
-@app.patch("/api/admin/guards/{guard_id}/assign")
-async def assign_guard(guard_id: int, building_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("UPDATE users SET building_id = %s WHERE id = %s AND role = 'guard'", (building_id, guard_id))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Guard not found")
-        db.commit()
-        return {"message": "Guard assigned to building"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error assigning guard: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/admin/guards/{guard_id}/block")
-async def block_guard(guard_id: int, block: bool, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("UPDATE users SET building_id = NULL WHERE id = %s AND role = 'guard'", (guard_id,))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Guard not found")
-        db.commit()
-        return {"message": f"Guard {'blocked' if block else 'unblocked'}"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error blocking guard: {str(e)}")
-    finally:
-        cursor.close()
-
-# Notifications
-@app.get("/api/notifications", response_model=List[Notification])
-async def list_notifications(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["resident", "guard"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM notifications WHERE user_id = %s", (current_user.id,))
-    notifications = cursor.fetchall()
-    cursor.close()
-    return [Notification(**n) for n in notifications]
-
-@app.patch("/api/notifications/{notification_id}/read")
-async def mark_notification_read(notification_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["resident", "guard"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("UPDATE notifications SET is_read = 1 WHERE id = %s AND user_id = %s", (notification_id, current_user.id))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Notification not found")
-        db.commit()
-        return {"message": "Notification marked as read"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating notification: {str(e)}")
-    finally:
-        cursor.close()
-
-# Dues & Payments
-@app.get("/api/admin/dues")
-async def list_dues(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    return {"dues": []}  # Placeholder
-
-@app.patch("/api/admin/dues/{due_id}/paid")
-async def mark_due_paid(due_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    return {"message": "Due marked as paid"}  # Placeholder
-
-# Audit Logs
-@app.get("/api/admin/audit", response_model=List[Log])
-async def list_audit_logs(
-    date_from: Optional[datetime] = Query(None),
-    date_to: Optional[datetime] = Query(None),
-    user_id: Optional[int] = Query(None),
-    action: Optional[str] = Query(None),
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    query = "SELECT * FROM logs WHERE 1=1"
-    params = []
-    if date_from:
-        query += " AND timestamp >= %s"
-        params.append(date_from)
-    if date_to:
-        query += " AND timestamp <= %s"
-        params.append(date_to)
-    if user_id:
-        query += " AND guard_id = %s"
-        params.append(user_id)
-    if action:
-        query += " AND action = %s"
-        params.append(action)
-    cursor = db.cursor(dictionary=True)
-    cursor.execute(query, params)
-    logs = cursor.fetchall()
-    cursor.close()
-    return [Log(**log) for log in logs]
-
-# Settings
-@app.get("/api/admin/settings")
-async def get_settings(current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    return {
-        "qr_expiry": "30 days",
-        "ocr_enabled": True,
-        "notification_templates": {
-            "approval": "Your vehicle {license_plate} has been approved.",
-            "rejection": "Your vehicle {license_plate} was rejected: {reason}"
+        otp = generate_otp()
+        otp_storage[user.id] = {
+            'otp': otp,
+            'timestamp': datetime.utcnow()
         }
-    }
-
-@app.patch("/api/admin/settings")
-async def update_settings(settings: dict, current_user: User = Depends(get_current_user)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    return {"message": "Settings updated"}  # Placeholder
-
-# Building / CCTV
-@app.get("/api/admin/buildings", response_model=List[Building])
-async def list_buildings(current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM buildings")
-    buildings = cursor.fetchall()
-    cursor.close()
-    return [Building(**b) for b in buildings]
-
-@app.post("/api/admin/buildings", response_model=Building)
-async def create_building(
-    name: str,
-    address: Optional[str],
-    cctv_settings: Optional[dict],
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute(
-            """
-            INSERT INTO buildings (name, address, cctv_settings, created_at)
-            VALUES (%s, %s, %s, NOW())
-            """,
-            (name, address, json.dumps(cctv_settings) if cctv_settings else None)
-        )
-        db.commit()
-        cursor.execute("SELECT * FROM buildings WHERE id = LAST_INSERT_ID()")
-        new_building = cursor.fetchone()
-        return Building(**new_building)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error creating building: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.patch("/api/admin/buildings/{building_id}", response_model=Building)
-async def update_building(
-    building_id: int,
-    name: Optional[str],
-    address: Optional[str],
-    cctv_settings: Optional[dict],
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor(dictionary=True)
-    try:
-        cursor.execute("SELECT * FROM buildings WHERE id = %s", (building_id,))
-        building = cursor.fetchone()
-        if not building:
-            raise HTTPException(status_code=404, detail="Building not found")
-        query = "UPDATE buildings SET "
-        params = []
-        if name:
-            query += "name = %s, "
-            params.append(name)
-        if address:
-            query += "address = %s, "
-            params.append(address)
-        if cctv_settings is not None:
-            query += "cctv_settings = %s, "
-            params.append(json.dumps(cctv_settings))
-        query = query.rstrip(", ") + " WHERE id = %s"
-        params.append(building_id)
-        cursor.execute(query, params)
-        db.commit()
-        cursor.execute("SELECT * FROM buildings WHERE id = %s", (building_id,))
-        updated_building = cursor.fetchone()
-        return Building(**updated_building)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error updating building: {str(e)}")
-    finally:
-        cursor.close()
-
-@app.delete("/api/admin/buildings/{building_id}")
-async def delete_building(building_id: int, current_user: User = Depends(get_current_user), db=Depends(get_db)):
-    if current_user.role not in ["admin", "superadmin"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    cursor = db.cursor()
-    try:
-        cursor.execute("DELETE FROM buildings WHERE id = %s", (building_id,))
-        if cursor.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Building not found")
-        db.commit()
-        return {"message": "Building deleted"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting building: {str(e)}")
-    finally:
-        cursor.close()
-
-# Add these endpoints at the END of your file, before the main block
-
-@app.post("/api/scan/plate", response_model=ScanResponse)
-async def scan_license_plate(
-    file: UploadFile = File(...),
-    camera_snapshot_url: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    """
-    Scan license plate from image and verify in database
-    """
-    if current_user.role != "guard":
-        raise HTTPException(status_code=403, detail="Only guards can scan vehicles")
-    
-    if reader is None:
-        return ScanResponse(
-            success=False,
-            error="OCR system not available. Please contact administrator."
-        )
-    
-    # Validate file type
-    if not file.content_type.startswith('image/'):
-        return ScanResponse(
-            success=False,
-            error="File must be an image (JPEG, PNG, etc.)"
-        )
-    
-    file_path = None
-    try:
-        logger.info(f"Starting scan for user {current_user.username}")
         
-        # Save uploaded file
-        file_path = save_uploaded_file(file)
+        if send_otp_email(user.email, otp):
+            return jsonify({
+                'message': 'OTP sent successfully to your email',
+                'user_id': user.id
+            }), 200
+        else:
+            # Fallback for development if email fails
+            return jsonify({
+                'message': 'OTP generated but email failed. For testing:',
+                'user_id': user.id,
+                'otp': otp 
+            }), 500
         
-        # Process image to extract license plate
-        license_plate = await process_license_plate_image(file_path)
+    except Exception as e:
+        logger.error(f"User login error: {str(e)}")
+        return jsonify({'error': 'Login failed'}), 500
+
+@app.route('/auth/user/verify', methods=['POST'])
+def user_verify_otp():
+    """Verify OTP and login user"""
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        otp = data.get('otp')
+        
+        if not user_id or not otp:
+            return jsonify({'error': 'User ID and OTP required'}), 400
+        
+        otp_data = otp_storage.get(int(user_id))
+        if not otp_data:
+            return jsonify({'error': 'OTP not found or expired. Please request a new one.'}), 404
+        
+        if datetime.utcnow() - otp_data['timestamp'] > timedelta(minutes=10):
+            del otp_storage[int(user_id)]
+            return jsonify({'error': 'OTP expired'}), 400
+        
+        if otp_data['otp'] == otp:
+            user = Resident.query.get(int(user_id))
+            if not user:
+                return jsonify({'error': 'User not found'}), 404
+            
+            additional_claims = {'role': 'resident', 'building_id': user.building_id, 'user_name': user.user_name}
+            access_token = create_access_token(
+                identity=user.id,
+                additional_claims=additional_claims
+            )
+            
+            del otp_storage[int(user_id)]
+            
+            return jsonify({
+                'message': 'Login successful',
+                'access_token': access_token,
+                'user': {
+                    'id': user.id,
+                    'user_name': user.user_name,
+                    'email': user.email,
+                    'building_id': user.building_id,
+                    'role': 'resident'
+                }
+            }), 200
+        else:
+            return jsonify({'error': 'Invalid OTP'}), 401
+            
+    except Exception as e:
+        logger.error(f"OTP verification error: {str(e)}")
+        return jsonify({'error': 'Verification failed'}), 500
+
+@app.route('/auth/logout', methods=['POST'])
+@jwt_required()
+def logout():
+    return jsonify({'message': 'Logout successful'}), 200
+
+
+# --- GUARD APP APIs ---
+@app.route('/guard/dashboard/stats', methods=['GET'])
+@jwt_required()
+def guard_dashboard_stats():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        today = datetime.utcnow().date()
+        
+        total_scans = Log.query.filter_by(guard_id=guard_id).count()
+        total_entries = Log.query.filter_by(guard_id=guard_id, action='entry').count()
+        total_exits = Log.query.filter_by(guard_id=guard_id, action='exit').count()
+        today_scans = Log.query.filter(
+            Log.guard_id == guard_id,
+            db.func.date(Log.timestamp) == today
+        ).count()
+        
+        return jsonify({
+            'stats': {
+                'total_scans': total_scans,
+                'total_entries': total_entries,
+                'total_exits': total_exits,
+                'today_scans': today_scans
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Guard stats error: {str(e)}")
+        return jsonify({'error': 'Failed to get stats'}), 500
+
+@app.route('/guard/dashboard/last-scan', methods=['GET'])
+@jwt_required()
+def guard_last_scan():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        
+        last_scan = Log.query.filter_by(guard_id=guard_id).order_by(Log.timestamp.desc()).first()
+        
+        if last_scan:
+            scan_data = {
+                'license_plate': last_scan.license_plate,
+                'action': last_scan.action,
+                'result': last_scan.result,
+                'timestamp': last_scan.timestamp.isoformat(),
+                'notes': last_scan.notes
+            }
+            return jsonify({'last_scan': scan_data}), 200
+        else:
+            return jsonify({'last_scan': None}), 200
+            
+    except Exception as e:
+        logger.error(f"Last scan error: {str(e)}")
+        return jsonify({'error': 'Failed to get last scan'}), 500
+
+# --- NEW OCR ENDPOINTS ---
+@app.route('/guard/scan/ocr', methods=['POST'])
+@jwt_required()
+def ocr_scan_upload():
+    """OCR scan endpoint for license plate extraction"""
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        building_id = claims.get('building_id')
+        
+        # Check if image is provided
+        data = request.get_json()
+        if not data or 'image_data' not in data:
+            return jsonify({'error': 'No image_data provided in JSON body'}), 400
+
+        image_data = data.get('image_data')
+
+        # Extract license plate using OCR
+        license_plate, message = extract_license_plate(image_data)
         
         if not license_plate:
-            return ScanResponse(
-                success=False,
-                error="Could not detect license plate in image. Please try again with a clearer image of the license plate."
+            # Log failed scan
+            log_entry = Log(
+                license_plate='UNKNOWN',
+                action='scan',
+                result='not_found',
+                source='not_found',
+                guard_id=guard_id,
+                notes=f'OCR failed: {message}',
+                captured_image=image_data
             )
+            db.session.add(log_entry)
+            db.session.commit()
+            
+            return jsonify({
+                'success': False,
+                'message': message,
+                'license_plate': None
+            }), 200
         
-        # Verify license plate in database
-        verification_result = await verify_license_plate_db(license_plate, db)
+        # Verify license plate
+        verification_result = verify_license_plate(license_plate, building_id)
+        
+        # Map verification status to log result
+        result_status = verification_result['status']
+        if result_status == 'registered':  # From Google Sheets
+            log_result = 'registered'
+        elif result_status == 'approved':  # From MySQL - approved vehicle
+            log_result = 'approved'  
+        elif result_status == 'pending':   # From MySQL - pending approval
+            log_result = 'pending'
+        elif result_status == 'rejected':  # From MySQL - rejected vehicle
+            log_result = 'not_found'
+        else:
+            log_result = 'not_found'
         
         # Log the scan
-        cursor = db.cursor()
-        cursor.execute(
-            """
-            INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url, timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                license_plate,
-                "scan",
-                verification_result["status"],
-                verification_result["source"],
-                current_user.id,
-                camera_snapshot_url
-            )
-        )
-        db.commit()
-        cursor.close()
-        
-        logger.info(f"Scan completed successfully: {license_plate} - {verification_result['status']}")
-        
-        return ScanResponse(
-            success=True,
+        log_entry = Log(
             license_plate=license_plate,
-            status=verification_result["status"],
-            source=verification_result["source"],
-            confidence=0.8,
-            vehicle_details=verification_result["vehicle_details"]
+            action='scan',
+            result=log_result,
+            source=verification_result['source'],
+            guard_id=guard_id,
+            notes=f'OCR scan: {message} | Status: {result_status}',
+            captured_image=image_data
         )
         
-    except Exception as e:
-        logger.error(f"Scan endpoint error: {str(e)}")
-        return ScanResponse(
-            success=False,
-            error=f"Scan failed: {str(e)}"
-        )
+        # Add vehicle ID if found in MySQL (not from Google Sheets)
+        if verification_result['source'] == 'mysql' and 'vehicle_id' in verification_result:
+            log_entry.vehicle_id = verification_result['vehicle_id']
         
-    finally:
-        # Clean up uploaded file
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                logger.info("Temporary file cleaned up")
-            except Exception as e:
-                logger.warning(f"Failed to delete temp file: {str(e)}")
-
-@app.post("/api/scan/quick")
-async def quick_scan(
-    license_plate: str = Query(..., description="Direct license plate input"),
-    camera_snapshot_url: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-    db=Depends(get_db)
-):
-    """
-    Quick scan with direct license plate input (manual entry fallback)
-    """
-    if current_user.role != "guard":
-        raise HTTPException(status_code=403, detail="Only guards can scan vehicles")
-    
-    try:
-        # Clean the license plate input
-        license_plate_clean = ''.join(c for c in license_plate.upper() if c.isalnum())
+        db.session.add(log_entry)
+        db.session.commit()
         
-        if len(license_plate_clean) < 6:
-            raise HTTPException(status_code=400, detail="Invalid license plate format")
-        
-        # Verify license plate in database
-        verification_result = await verify_license_plate_db(license_plate_clean, db)
-        
-        # Log the scan
-        cursor = db.cursor()
-        cursor.execute(
-            """
-            INSERT INTO logs (license_plate, action, result, source, guard_id, snapshot_url, timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                license_plate_clean,
-                "manual_scan",
-                verification_result["status"],
-                verification_result["source"],
-                current_user.id,
-                camera_snapshot_url
-            )
-        )
-        db.commit()
-        cursor.close()
-        
-        return {
-            "success": True,
-            "license_plate": license_plate_clean,
-            "status": verification_result["status"],
-            "source": verification_result["source"],
-            "vehicle_details": verification_result["vehicle_details"]
+        response_data = {
+            'success': True,
+            'message': message,
+            'license_plate': license_plate,
+            'verification_result': verification_result,
+            'log_result': log_result
         }
         
-    except HTTPException:
-        raise
+        return jsonify(response_data), 200
+        
     except Exception as e:
-        logger.error(f"Quick scan error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+        db.session.rollback()
+        logger.error(f"OCR scan error: {str(e)}")
+        return jsonify({'error': 'OCR scan failed'}), 500
 
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.route('/guard/scan/quick-verify', methods=['POST'])
+@jwt_required()
+def quick_verify():
+    """Quick verify endpoint that combines OCR + verification in one call"""
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        building_id = claims.get('building_id')
+        
+        data = request.get_json()
+        image_data = data.get('image_data')
+        
+        if not image_data:
+            return jsonify({'error': 'No image data provided'}), 400
+        
+        # Step 1: Extract license plate using OCR
+        license_plate, ocr_message = extract_license_plate(image_data)
+        
+        if not license_plate:
+            # Log failed OCR attempt
+            log_entry = Log(
+                license_plate='UNKNOWN',
+                action='scan',
+                result='not_found',
+                source='not_found',
+                guard_id=guard_id,
+                notes=f'OCR failed: {ocr_message}',
+                captured_image=image_data
+            )
+            db.session.add(log_entry)
+            db.session.commit()
+            
+            return jsonify({
+                'success': False,
+                'message': ocr_message,
+                'license_plate': None,
+                'verified': False
+            }), 200
+        
+        # Step 2: Verify license plate
+        verification_result = verify_license_plate(license_plate, building_id)
+        
+        # Step 3: Map verification status to log result
+        result_status = verification_result['status']
+        if result_status == 'registered':  # From Google Sheets
+            log_result = 'registered'
+        elif result_status == 'approved':  # From MySQL - approved vehicle
+            log_result = 'approved'  
+        elif result_status == 'pending':   # From MySQL - pending approval
+            log_result = 'pending'
+        elif result_status == 'rejected':  # From MySQL - rejected vehicle
+            log_result = 'not_found'  # Treat rejected as not found for access purposes
+        else:
+            log_result = 'not_found'  # Default for not_found or other statuses
+        
+        # Step 4: Log the action
+        log_entry = Log(
+            license_plate=license_plate,
+            action='scan',
+            result=log_result,
+            source=verification_result['source'],
+            guard_id=guard_id,
+            notes=f'Quick verify: {ocr_message} | Verification: {result_status}',
+            captured_image=image_data
+        )
+        
+        # Add vehicle ID if found in MySQL (not from Google Sheets)
+        if verification_result['source'] == 'mysql' and 'vehicle_id' in verification_result:
+            log_entry.vehicle_id = verification_result['vehicle_id']
+        
+        db.session.add(log_entry)
+        db.session.commit()
+        
+        # Step 5: Prepare response - consider vehicle "verified" if registered or approved
+        is_verified = result_status in ['registered', 'approved']
+        
+        response_data = {
+            'success': True,
+            'message': f'License plate extracted: {license_plate}',
+            'license_plate': license_plate,
+            'verified': is_verified,
+            'verification_details': verification_result,
+            'log_result': log_result  # For debugging
+        }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Quick verify error: {str(e)}")
+        return jsonify({'error': 'Quick verification failed'}), 500
+# --- END NEW OCR ENDPOINTS ---
 
+@app.route('/guard/scan/manual-entry', methods=['POST'])
+@jwt_required()
+def manual_plate_entry():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        data = request.get_json()
+        
+        license_plate = data.get('license_plate')
+        if not license_plate:
+            return jsonify({'error': 'License plate required'}), 400
+        
+        notes = data.get('notes', '')
+        
+        vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        
+        if vehicle:
+            log_entry = Log(
+                vehicle_id=vehicle.id,
+                license_plate=license_plate,
+                action='manual_entry',
+                result='registered',
+                source='mysql',
+                guard_id=guard_id,
+                notes=notes
+            )
+            result_msg = 'Vehicle registered'
+            result_type = 'registered'
+        else:
+            unregistered_visit = UnregisteredVisit(
+                license_plate=license_plate,
+                guard_id=guard_id,
+                notes=notes,
+                building_id=claims.get('building_id')
+            )
+            db.session.add(unregistered_visit)
+            db.session.flush()
+            
+            log_entry = Log(
+                unregistered_visit_id=unregistered_visit.id,
+                license_plate=license_plate,
+                action='manual_entry',
+                result='unregistered',
+                source='mysql',
+                guard_id=guard_id,
+                notes=notes
+            )
+            result_msg = 'Unregistered vehicle logged'
+            result_type = 'unregistered'
+        
+        db.session.add(log_entry)
+        db.session.commit()
+        
+        return jsonify({
+            'message': result_msg,
+            'result': result_type,
+            'license_plate': license_plate
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Manual entry error: {str(e)}")
+        return jsonify({'error': 'Failed to log manual entry'}), 500
+
+@app.route('/guard/scan/confirm-entry', methods=['POST'])
+@jwt_required()
+def confirm_entry():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        data = request.get_json()
+        
+        license_plate = data.get('license_plate')
+        captured_image = data.get('captured_image')
+        
+        if not license_plate:
+            return jsonify({'error': 'License plate required'}), 400
+        
+        vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        
+        if vehicle and vehicle.status == 'approved':
+            log_entry = Log(
+                vehicle_id=vehicle.id,
+                license_plate=license_plate,
+                action='entry',
+                result='registered',
+                source='mysql',
+                guard_id=guard_id,
+                captured_image=captured_image,
+                notes='Vehicle entry confirmed'
+            )
+            result_type = 'registered'
+        else:
+            unregistered_visit = UnregisteredVisit(
+                license_plate=license_plate,
+                guard_id=guard_id,
+                building_id=claims.get('building_id'),
+                vehicle_image=captured_image
+            )
+            db.session.add(unregistered_visit)
+            db.session.flush()
+            
+            log_entry = Log(
+                unregistered_visit_id=unregistered_visit.id,
+                license_plate=license_plate,
+                action='entry',
+                result='unregistered',
+                source='mysql',
+                guard_id=guard_id,
+                captured_image=captured_image,
+                notes='Unregistered vehicle entry'
+            )
+            result_type = 'unregistered'
+            
+            # Here you might want to notify all admins of this building
+            admins = Admin.query.filter_by(building_id=claims.get('building_id')).all()
+            for admin in admins:
+                create_notification(
+                    user_type='admin',
+                    user_id=admin.id,
+                    notification_type='suspicious_activity',
+                    message=f'Unregistered vehicle {license_plate} entered the premises'
+                )
+        
+        db.session.add(log_entry)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Entry confirmed',
+            'result': result_type,
+            'license_plate': license_plate
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Confirm entry error: {str(e)}")
+        return jsonify({'error': 'Failed to confirm entry'}), 500
+
+@app.route('/guard/scan/confirm-exit', methods=['POST'])
+@jwt_required()
+def confirm_exit():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        data = request.get_json()
+        license_plate = data.get('license_plate')
+        
+        if not license_plate:
+            return jsonify({'error': 'License plate required'}), 400
+        
+        unregistered_visit = UnregisteredVisit.query.filter_by(
+            license_plate=license_plate,
+            exit_timestamp=None
+        ).order_by(UnregisteredVisit.entry_timestamp.desc()).first()
+        
+        visit_id = None
+        result_type = 'registered'
+        if unregistered_visit:
+            unregistered_visit.exit_timestamp = datetime.utcnow()
+            visit_id = unregistered_visit.id
+            result_type = 'unregistered'
+        
+        vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        
+        log_entry = Log(
+            vehicle_id=vehicle.id if vehicle else None,
+            unregistered_visit_id=visit_id,
+            license_plate=license_plate,
+            action='exit',
+            result=result_type,
+            source='mysql',
+            guard_id=guard_id,
+            notes='Vehicle exit confirmed'
+        )
+        
+        db.session.add(log_entry)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Exit confirmed',
+            'result': result_type,
+            'license_plate': license_plate
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Confirm exit error: {str(e)}")
+        return jsonify({'error': 'Failed to confirm exit'}), 500
+
+@app.route('/guard/logs/my-scans', methods=['GET'])
+@jwt_required()
+def guard_my_scans():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        guard_id = get_jwt_identity()
+        filter_type = request.args.get('filter', 'today') # today, week, all
+        
+        query = Log.query.filter_by(guard_id=guard_id)
+        
+        today = datetime.utcnow().date()
+        if filter_type == 'today':
+            # FIX: Use datetime.utcnow() instead of just datetime
+            start_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            query = query.filter(Log.timestamp >= start_date)
+        elif filter_type == 'week':
+            start_date = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=7)
+            query = query.filter(Log.timestamp >= start_date)
+        
+        logs = query.order_by(Log.timestamp.desc()).limit(50).all()
+        
+        logs_data = [{
+            'id': log.id,
+            'license_plate': log.license_plate,
+            'action': log.action,
+            'result': log.result,
+            'source': log.source,
+            'timestamp': log.timestamp.isoformat(),
+            'notes': log.notes,
+            'snapshot_url': log.snapshot_url
+        } for log in logs]
+        
+        return jsonify({'logs': logs_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Guard logs error: {str(e)}")
+        return jsonify({'error': 'Failed to get logs'}), 500
+
+
+# --- USER APP APIs ---
+@app.route('/user/vehicles', methods=['GET'])
+@jwt_required()
+def get_my_vehicles():
+    try:
+        claims = get_jwt()
+        user_name = claims.get('user_name')
+        
+        if claims.get('role') not in ['resident', 'rental']:
+            return jsonify({'error': 'Access denied'}), 403
+        
+        vehicles = Vehicle.query.filter_by(owner_name=user_name).all()
+        
+        vehicles_data = [{
+            'id': vehicle.id,
+            'license_plate': vehicle.license_plate,
+            'model': vehicle.model,
+            'vehicle_type': vehicle.vehicle_type,
+            'color': vehicle.color,
+            'status': vehicle.status,
+            'rejected_reason': vehicle.rejected_reason,
+            'created_at': vehicle.created_at.isoformat() if vehicle.created_at else None
+        } for vehicle in vehicles]
+        
+        return jsonify({'vehicles': vehicles_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Get vehicles error: {str(e)}")
+        return jsonify({'error': 'Failed to get vehicles'}), 500
+
+@app.route('/user/vehicles/add', methods=['POST'])
+@jwt_required()
+def add_vehicle():
+    try:
+        claims = get_jwt()
+        if claims.get('role') not in ['resident', 'rental']:
+            return jsonify({'error': 'Access denied'}), 403
+        
+        data = request.get_json()
+        license_plate = data.get('license_plate')
+        if not license_plate:
+            return jsonify({'error': 'License plate required'}), 400
+        
+        if Vehicle.query.filter_by(license_plate=license_plate).first():
+            return jsonify({'error': 'Vehicle with this license plate already exists'}), 409
+        
+        new_vehicle = Vehicle(
+            license_plate=license_plate,
+            model=data.get('model'),
+            vehicle_type=data.get('vehicle_type'),
+            color=data.get('color'),
+            vehicle_image=data.get('vehicle_image'),
+            owner_type=claims.get('role'),
+            owner_name=claims.get('user_name'),
+            status='pending',
+            created_at=datetime.utcnow()
+        )
+        db.session.add(new_vehicle)
+        
+        admins = Admin.query.filter_by(building_id=claims.get('building_id')).all()
+        for admin in admins:
+            create_notification(
+                user_type='admin',
+                user_id=admin.id,
+                notification_type='approval',
+                message=f'New vehicle {license_plate} from {claims.get("user_name")} is awaiting approval.'
+            )
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Vehicle added successfully and is pending approval',
+            'vehicle_id': new_vehicle.id
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Add vehicle error: {str(e)}")
+        return jsonify({'error': 'Failed to add vehicle'}), 500
+
+@app.route('/user/history', methods=['GET'])
+@jwt_required()
+def get_parking_history():
+    try:
+        claims = get_jwt()
+        if claims.get('role') not in ['resident', 'rental']:
+            return jsonify({'error': 'Access denied'}), 403
+        
+        user_vehicles = Vehicle.query.filter_by(owner_name=claims.get('user_name')).all()
+        license_plates = [v.license_plate for v in user_vehicles]
+        
+        if not license_plates:
+            return jsonify({'history': []}), 200
+
+        logs = Log.query.filter(Log.license_plate.in_(license_plates)) \
+            .order_by(Log.timestamp.desc()).limit(50).all()
+        
+        history_data = [{
+            'license_plate': log.license_plate,
+            'action': log.action,
+            'result': log.result,
+            'timestamp': log.timestamp.isoformat(),
+            'notes': log.notes
+        } for log in logs]
+        
+        return jsonify({'history': history_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Parking history error: {str(e)}")
+        return jsonify({'error': 'Failed to get parking history'}), 500
+
+
+# --- ADMIN DASHBOARD APIs ---
+@app.route('/admin/dashboard/overview', methods=['GET'])
+@jwt_required()
+def admin_dashboard_overview():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'admin':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        building_id = claims.get('building_id')
+        
+        resident_vehicles_query = db.session.query(Vehicle).join(Resident, Vehicle.owner_name == Resident.user_name).filter(Resident.building_id == building_id)
+
+        total_residents = Resident.query.filter_by(building_id=building_id).count()
+        total_vehicles = resident_vehicles_query.count()
+        pending_vehicles = resident_vehicles_query.filter(Vehicle.status == 'pending').count()
+
+        today_logs = Log.query.join(Guard, Log.guard_id == Guard.id).filter(
+            Guard.building_id == building_id,
+            db.func.date(Log.timestamp) == datetime.utcnow().date()
+        ).count()
+        
+        return jsonify({
+            'stats': {
+                'total_residents': total_residents,
+                'total_vehicles': total_vehicles,
+                'pending_vehicles': pending_vehicles,
+                'today_logs': today_logs
+            }
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Admin dashboard error: {str(e)}")
+        return jsonify({'error': 'Failed to get dashboard data'}), 500
+
+@app.route('/admin/vehicles', methods=['GET'])
+@jwt_required()
+def admin_list_vehicles():
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'admin':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        status_filter = request.args.get('status')
+        building_id = claims.get('building_id')
+        
+        query = Vehicle.query.join(Resident, Vehicle.owner_name == Resident.user_name).filter(Resident.building_id == building_id)
+        
+        if status_filter in ['pending', 'approved', 'rejected']:
+            query = query.filter(Vehicle.status == status_filter)
+        
+        vehicles = query.order_by(Vehicle.created_at.desc()).all()
+        
+        vehicles_data = [{
+            'id': vehicle.id,
+            'license_plate': vehicle.license_plate,
+            'model': vehicle.model,
+            'vehicle_type': vehicle.vehicle_type,
+            'color': vehicle.color,
+            'owner_name': vehicle.owner_name,
+            'status': vehicle.status,
+            'rejected_reason': vehicle.rejected_reason,
+            'created_at': vehicle.created_at.isoformat() if vehicle.created_at else None
+        } for vehicle in vehicles]
+        
+        return jsonify({'vehicles': vehicles_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Admin vehicles list error: {str(e)}")
+        return jsonify({'error': 'Failed to get vehicles list'}), 500
+
+@app.route('/admin/vehicles/<int:vehicle_id>/approve', methods=['POST'])
+@jwt_required()
+def admin_approve_vehicle(vehicle_id):
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'admin':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        vehicle = Vehicle.query.get(vehicle_id)
+        if not vehicle:
+            return jsonify({'error': 'Vehicle not found'}), 404
+        
+        vehicle.status = 'approved'
+        vehicle.approved_by_admin_id = get_jwt_identity()
+        vehicle.approved_at = datetime.utcnow()
+        
+        owner = Resident.query.filter_by(user_name=vehicle.owner_name).first()
+        if owner:
+            create_notification(
+                user_type='resident',
+                user_id=owner.id,
+                notification_type='approval',
+                message=f'Your vehicle {vehicle.license_plate} has been approved.'
+            )
+        
+        db.session.commit()
+        return jsonify({'message': 'Vehicle approved successfully'}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Approve vehicle error: {str(e)}")
+        return jsonify({'error': 'Failed to approve vehicle'}), 500
+
+@app.route('/admin/vehicles/<int:vehicle_id>/reject', methods=['POST'])
+@jwt_required()
+def admin_reject_vehicle(vehicle_id):
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'admin':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        reason = request.json.get('reason', 'No reason provided.')
+        
+        vehicle = Vehicle.query.get(vehicle_id)
+        if not vehicle:
+            return jsonify({'error': 'Vehicle not found'}), 404
+        
+        vehicle.status = 'rejected'
+        vehicle.rejected_reason = reason
+        
+        owner = Resident.query.filter_by(user_name=vehicle.owner_name).first()
+        if owner:
+            create_notification(
+                user_type='resident',
+                user_id=owner.id,
+                notification_type='rejection',
+                message=f'Your vehicle {vehicle.license_plate} was rejected: {reason}'
+            )
+            
+        db.session.commit()
+        return jsonify({'message': 'Vehicle rejected successfully'}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Reject vehicle error: {str(e)}")
+        return jsonify({'error': 'Failed to reject vehicle'}), 500
+
+
+# --- NOTIFICATIONS APIs ---
+@app.route('/notifications/my', methods=['GET'])
+@jwt_required()
+def get_my_notifications():
+    try:
+        claims = get_jwt()
+        user_id = get_jwt_identity()
+        user_role = claims.get('role')
+        
+        notifications = Notification.query.filter_by(
+            user_type=user_role,
+            user_id=user_id
+        ).order_by(Notification.sent_at.desc()).limit(20).all()
+        
+        notifications_data = [{
+            'id': notification.id,
+            'type': notification.type,
+            'message': notification.message,
+            'sent_at': notification.sent_at.isoformat(),
+            'is_read': notification.is_read
+        } for notification in notifications]
+        
+        return jsonify({'notifications': notifications_data}), 200
+        
+    except Exception as e:
+        logger.error(f"Get notifications error: {str(e)}")
+        return jsonify({'error': 'Failed to get notifications'}), 500
+
+@app.route('/notifications/<int:notification_id>/mark-read', methods=['PATCH'])
+@jwt_required()
+def mark_notification_read(notification_id):
+    try:
+        claims = get_jwt()
+        
+        notification = Notification.query.filter_by(
+            id=notification_id,
+            user_type=claims.get('role'),
+            user_id=get_jwt_identity()
+        ).first()
+        
+        if not notification:
+            return jsonify({'error': 'Notification not found or access denied'}), 404
+        
+        notification.is_read = True
+        db.session.commit()
+        
+        return jsonify({'message': 'Notification marked as read'}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Mark notification read error: {str(e)}")
+        return jsonify({'error': 'Failed to mark notification as read'}), 500
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        try:
+            logger.info("Attempting to connect to the database...")
+            db.engine.connect()
+            logger.info("Database connection successful.")
+            db.create_all()
+            logger.info("Database tables checked/created.")
+        except Exception as e:
+            logger.error(f"Database initialization error: {str(e)}")
+            # Exit or handle as needed, for now we just log it
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
