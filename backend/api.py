@@ -486,7 +486,7 @@ def guard_login():
     except Exception as e:
         logger.error(f"Guard login error: {str(e)}")
         return jsonify({'error': 'Login failed'}), 500
- 
+
 @app.route('/auth/user/login', methods=['POST'])
 def user_login():
     """User login with email/phone and password"""
