@@ -1601,8 +1601,8 @@ def guard_last_scan():
 # --- NEW OCR ENDPOINTS ---
 @app.route('/guard/scan/ocr', methods=['POST'])
 @jwt_required()
-def ocr_scan_upload():
-    """OCR scan endpoint for license plate extraction"""
+def ocr_scan_upload_fixed():
+    """OCR scan endpoint with fixed response format for React app"""
     try:
         claims = get_jwt()
         if claims.get('role') != 'guard':
@@ -1622,73 +1622,54 @@ def ocr_scan_upload():
         license_plate, message = extract_license_plate(image_data)
         
         if not license_plate:
-            # Log failed scan
-            log_entry = Log(
-                license_plate='UNKNOWN',
-                action='scan',
-                result='not_found',
-                source='not_found',
-                guard_id=guard_id,
-                notes=f'OCR failed: {message}',
-                captured_image=image_data
-            )
-            db.session.add(log_entry)
-            db.session.commit()
-            
             return jsonify({
                 'success': False,
                 'message': message,
-                'license_plate': None
+                'data': None
             }), 200
         
         # Verify license plate
         verification_result = verify_license_plate(license_plate, building_id)
         
-        # Map verification status to log result
-        result_status = verification_result['status']
-        if result_status == 'registered':  # From Google Sheets
-            log_result = 'registered'
-        elif result_status == 'approved':  # From MySQL - approved vehicle
-            log_result = 'approved'  
-        elif result_status == 'pending':   # From MySQL - pending approval
-            log_result = 'pending'
-        elif result_status == 'rejected':  # From MySQL - rejected vehicle
-            log_result = 'not_found'
-        else:
-            log_result = 'not_found'
+        # Prepare response data for React app
+        response_data = {
+            'numberPlate': license_plate,
+            'vehicleType': verification_result.get('data', {}).get('vehicle_type', 'Unknown'),
+            'ownerName': verification_result.get('data', {}).get('owner_name', 'Unknown'),
+            'status': verification_result.get('status', 'not_found')
+        }
         
         # Log the scan
         log_entry = Log(
             license_plate=license_plate,
             action='scan',
-            result=log_result,
-            source=verification_result['source'],
+            result=verification_result.get('status', 'not_found'),
+            source=verification_result.get('source', 'not_found'),
             guard_id=guard_id,
-            notes=f'OCR scan: {message} | Status: {result_status}',
-            captured_image=image_data
+            notes=f'OCR scan: {message}',
+            captured_image=image_data[:100] + '...' if image_data else None  # Store partial image data
         )
-        
-        # Add vehicle ID if found in MySQL (not from Google Sheets)
-        if verification_result['source'] == 'mysql' and 'vehicle_id' in verification_result:
-            log_entry.vehicle_id = verification_result['vehicle_id']
         
         db.session.add(log_entry)
         db.session.commit()
         
-        response_data = {
+        return jsonify({
             'success': True,
-            'message': message,
-            'license_plate': license_plate,
-            'verification_result': verification_result,
-            'log_result': log_result
-        }
-        
-        return jsonify(response_data), 200
+            'message': 'License plate extracted successfully',
+            'data': response_data
+        }), 200
         
     except Exception as e:
         db.session.rollback()
         logger.error(f"OCR scan error: {str(e)}")
-        return jsonify({'error': 'OCR scan failed'}), 500
+        return jsonify({
+            'success': False,
+            'message': f'OCR processing failed: {str(e)}',
+            'data': None
+        }), 500
+        
+        
+        
 
 @app.route('/guard/scan/quick-verify', methods=['POST'])
 @jwt_required()
@@ -1785,6 +1766,58 @@ def quick_verify():
         logger.error(f"Quick verify error: {str(e)}")
         return jsonify({'error': 'Quick verification failed'}), 500
 # --- END NEW OCR ENDPOINTS ---
+
+@app.route('/guard/scan/register', methods=['POST'])
+@jwt_required()
+def register_vehicle():
+    """Register a new vehicle (for manual entry after OCR fails)"""
+    try:
+        claims = get_jwt()
+        if claims.get('role') != 'guard':
+            return jsonify({'error': 'Access denied'}), 403
+        
+        data = request.get_json()
+        
+        # Extract vehicle data
+        license_plate = data.get('numberPlate')
+        vehicle_type = data.get('vehicleType')
+        owner_name = data.get('ownerName')
+        vehicle_model = data.get('vehicleModel')
+        color = data.get('color')
+        
+        if not license_plate or not vehicle_type:
+            return jsonify({'error': 'Number plate and vehicle type are required'}), 400
+        
+        # Check if vehicle already exists
+        existing_vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        if existing_vehicle:
+            return jsonify({'error': 'Vehicle with this license plate already exists'}), 409
+        
+        # Create new vehicle (pending approval)
+        new_vehicle = Vehicle(
+            license_plate=license_plate,
+            model=vehicle_model,
+            vehicle_type=vehicle_type,
+            color=color,
+            owner_type='resident',  # Default to resident
+            owner_name=owner_name or 'Unknown',
+            status='pending',
+            created_at=datetime.utcnow()
+        )
+        
+        db.session.add(new_vehicle)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Vehicle registered successfully and pending approval',
+            'vehicle_id': new_vehicle.id
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Vehicle registration error: {str(e)}")
+        return jsonify({'error': 'Failed to register vehicle'}), 500
 
 @app.route('/guard/scan/manual-entry', methods=['POST'])
 @jwt_required()
