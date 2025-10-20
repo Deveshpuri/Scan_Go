@@ -318,43 +318,133 @@ def get_google_sheets_service(admin_id):
         return None
 
 def check_google_sheet(license_plate, building_id):
-    """Check license plate in Google Sheet"""
+    """Check license plate in Google Sheet with better error handling"""
     try:
+        logger.info(f"Checking Google Sheet for license plate: {license_plate} in building: {building_id}")
+        
         building = Building.query.get(building_id)
-        if not building or not building.google_sheet_id:
+        if not building:
+            logger.warning(f"Building {building_id} not found")
             return None
+        
+        if not building.google_sheet_id:
+            logger.warning(f"No Google Sheet ID configured for building {building_id}")
+            return None
+        
+        logger.info(f"Google Sheet ID: {building.google_sheet_id}")
         
         # Get admin for this building
         admin = Admin.query.get(building.admin_id)
         if not admin:
+            logger.warning(f"No admin found for building {building_id}")
             return None
+        
+        logger.info(f"Found admin: {admin.user_name} (ID: {admin.id})")
+        
+        # Check if admin has Google credentials
+        if not admin.google_credentials:
+            logger.warning(f"Admin {admin.id} has no Google credentials configured")
+            # Try to use service account or public sheet access as fallback
+            return check_google_sheet_public(license_plate, building.google_sheet_id)
         
         service = get_google_sheets_service(admin.id)
         if not service:
-            return None
+            logger.warning(f"Google Sheets service creation failed for admin {admin.id}")
+            # Fallback to public access
+            return check_google_sheet_public(license_plate, building.google_sheet_id)
         
         # Read data from Google Sheet
         sheet = service.spreadsheets()
         result = sheet.values().get(
             spreadsheetId=building.google_sheet_id,
-            range='A:Z'  # Adjust range as needed
+            range='A:E'  # Specific range for your columns
         ).execute()
         
         values = result.get('values', [])
         
-        # Search for license plate
-        for row in values:
-            if row and license_plate.upper() in [str(cell).upper() for cell in row]:
-                return {
-                    'found': True,
-                    'source': 'google_sheet',
-                    'data': row
-                }
+        if not values:
+            logger.info(f"No data found in Google Sheet")
+            return {'found': False, 'source': 'google_sheet'}
         
+        # Skip header row if exists
+        start_index = 0
+        if values and any('License Plate' in str(cell) for cell in values[0]):
+            start_index = 1  # Skip header row
+            logger.info("Skipping header row")
+        
+        # Search for license plate in first column
+        target_plate = license_plate.upper().strip()
+        logger.info(f"Searching for: {target_plate}")
+        
+        for row_index, row in enumerate(values[start_index:], start_index + 1):
+            if row and len(row) > 0:
+                sheet_plate = str(row[0]).upper().strip()
+                logger.info(f"Checking row {row_index}: {sheet_plate}")
+                
+                if sheet_plate == target_plate:
+                    logger.info(f"✅ FOUND in Google Sheet at row {row_index}: {row}")
+                    return {
+                        'found': True,
+                        'source': 'google_sheet',
+                        'data': row,
+                        'row_index': row_index
+                    }
+        
+        logger.info(f"❌ NOT FOUND in Google Sheet")
         return {'found': False, 'source': 'google_sheet'}
         
     except Exception as e:
         logger.error(f"Google Sheet check error: {str(e)}")
+        # Fallback to public access on error
+        try:
+            if building and building.google_sheet_id:
+                return check_google_sheet_public(license_plate, building.google_sheet_id)
+        except:
+            pass
+        return None
+
+def check_google_sheet_public(license_plate, google_sheet_id):
+    """Fallback method to check Google Sheet without authentication"""
+    try:
+        logger.info(f"Trying public access for sheet: {google_sheet_id}")
+        
+        # For public sheets, you can use this URL format
+        import requests
+        
+        # Convert to CSV export URL
+        csv_url = f"https://docs.google.com/spreadsheets/d/{google_sheet_id}/export?format=csv"
+        
+        response = requests.get(csv_url, timeout=10)
+        if response.status_code == 200:
+            import csv
+            import io
+            
+            # Parse CSV content
+            csv_content = response.content.decode('utf-8')
+            csv_reader = csv.reader(io.StringIO(csv_content))
+            
+            target_plate = license_plate.upper().strip()
+            
+            for row_index, row in enumerate(csv_reader):
+                if row and len(row) > 0:
+                    sheet_plate = str(row[0]).upper().strip()
+                    if sheet_plate == target_plate:
+                        logger.info(f"✅ FOUND in public Google Sheet: {row}")
+                        return {
+                            'found': True,
+                            'source': 'google_sheet_public',
+                            'data': row,
+                            'row_index': row_index + 1
+                        }
+            
+            logger.info(f"❌ NOT FOUND in public Google Sheet")
+            return {'found': False, 'source': 'google_sheet_public'}
+        else:
+            logger.warning(f"Public access failed with status: {response.status_code}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Public Google Sheet check error: {str(e)}")
         return None
 
 def verify_license_plate(license_plate, building_id):
@@ -1705,6 +1795,7 @@ def manual_plate_entry():
             return jsonify({'error': 'Access denied'}), 403
         
         guard_id = get_jwt_identity()
+        building_id = claims.get('building_id')
         data = request.get_json()
         
         license_plate = data.get('license_plate')
@@ -1713,54 +1804,93 @@ def manual_plate_entry():
         
         notes = data.get('notes', '')
         
-        vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
+        logger.info(f"Manual entry request: {license_plate} for building {building_id}")
         
-        if vehicle:
-            log_entry = Log(
-                vehicle_id=vehicle.id,
-                license_plate=license_plate,
-                action='manual_entry',
-                result='registered',
-                source='mysql',
-                guard_id=guard_id,
-                notes=notes
-            )
-            result_msg = 'Vehicle registered'
-            result_type = 'registered'
+        # TWO-LAYER VERIFICATION: Google Sheets → MySQL
+        
+        # Step 1: First check Google Sheet
+        google_result = check_google_sheet(license_plate, building_id)
+        
+        if google_result:
+            if google_result.get('found'):
+                # Found in Google Sheet - registered vehicle
+                log_entry = Log(
+                    license_plate=license_plate,
+                    action='manual_entry',
+                    result='registered',
+                    source=google_result.get('source', 'google_sheet'),
+                    guard_id=guard_id,
+                    notes=f'{notes} | Sheet data: {google_result.get("data")}'
+                )
+                result_msg = f'Vehicle registered ({google_result.get("source", "Google Sheet")})'
+                result_type = 'registered'
+                
+            else:
+                # Google Sheet accessible but plate not found
+                logger.info("Google Sheet accessible but plate not found, checking MySQL...")
+                # Continue to MySQL check
+                google_result = None
         else:
-            unregistered_visit = UnregisteredVisit(
-                license_plate=license_plate,
-                guard_id=guard_id,
-                notes=notes,
-                building_id=claims.get('building_id')
-            )
-            db.session.add(unregistered_visit)
-            db.session.flush()
+            # Google Sheet not accessible
+            logger.warning("Google Sheet not accessible, checking MySQL directly...")
+        
+        # Step 2: If not found in Google Sheet (or not accessible), check MySQL database
+        if not google_result or not google_result.get('found'):
+            vehicle = Vehicle.query.filter_by(license_plate=license_plate).first()
             
-            log_entry = Log(
-                unregistered_visit_id=unregistered_visit.id,
-                license_plate=license_plate,
-                action='manual_entry',
-                result='unregistered',
-                source='mysql',
-                guard_id=guard_id,
-                notes=notes
-            )
-            result_msg = 'Unregistered vehicle logged'
-            result_type = 'unregistered'
+            if vehicle:
+                # Found in MySQL database
+                log_entry = Log(
+                    vehicle_id=vehicle.id,
+                    license_plate=license_plate,
+                    action='manual_entry',
+                    result='registered',
+                    source='mysql',
+                    guard_id=guard_id,
+                    notes=notes
+                )
+                result_msg = 'Vehicle registered (Database)'
+                result_type = 'registered'
+                source = 'mysql'
+            else:
+                # Not found in either Google Sheet or MySQL - unregistered vehicle
+                unregistered_visit = UnregisteredVisit(
+                    license_plate=license_plate,
+                    guard_id=guard_id,
+                    notes=notes,
+                    building_id=building_id
+                )
+                db.session.add(unregistered_visit)
+                db.session.flush()
+                
+                log_entry = Log(
+                    unregistered_visit_id=unregistered_visit.id,
+                    license_plate=license_plate,
+                    action='manual_entry',
+                    result='unregistered',
+                    source='not_found',
+                    guard_id=guard_id,
+                    notes=f'{notes} | Checked: Google Sheet & Database'
+                )
+                result_msg = 'Unregistered vehicle logged'
+                result_type = 'unregistered'
+                source = 'not_found'
         
         db.session.add(log_entry)
         db.session.commit()
         
+        logger.info(f"Manual entry result: {result_msg}")
+        
         return jsonify({
             'message': result_msg,
             'result': result_type,
-            'license_plate': license_plate
+            'license_plate': license_plate,
+            'source': log_entry.source
         }), 200
         
     except Exception as e:
         db.session.rollback()
-        logger.error(f"Manual entry error: {str(e)}")
+        logger.error(f"Manual entry error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Failed to log manual entry'}), 500
 
 @app.route('/guard/scan/confirm-entry', methods=['POST'])
