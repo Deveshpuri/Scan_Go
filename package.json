@@ -1,0 +1,23 @@
+{
+  "name": "scan_go",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/Deveshpuri/Scan_Go#readme",
+  "bugs": {
+    "url": "https://github.com/Deveshpuri/Scan_Go/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Deveshpuri/Scan_Go.git"
+  },
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "frontend-user" : "cd frontend && cd userApp && npx expo start",
+    "frontend-guard" : "cd frontend && cd guardApp && npx expo start",
+    "frontend-admin" : "cd frontend && cd adminPanel && npm run dev"
+  }
+}
