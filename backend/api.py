@@ -1618,6 +1618,7 @@ def ocr_scan_upload_fixed():
 
         image_data = data.get('image_data')
 
+
         # Extract license plate using OCR
         license_plate, message = extract_license_plate(image_data)
         
